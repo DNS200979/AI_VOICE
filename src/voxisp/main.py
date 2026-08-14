@@ -19,7 +19,7 @@ from voxisp.connectors import get_connector
 from voxisp.db.repository import CallRepository
 from voxisp.db.session import build_session_maker, init_models
 from voxisp.observability.logging import configure_logging, get_logger
-from voxisp.orchestrator import CallOrchestrator, get_llm_client
+from voxisp.orchestrator import CallOrchestrator, get_llm_client, get_tool_executor
 
 configure_logging()
 logger = get_logger(__name__)
@@ -71,6 +71,7 @@ async def health() -> dict:
         "status": "ok",
         "isp_connector": settings.isp_connector,
         "llm_provider": settings.llm_provider,
+        "tool_calling_enabled": settings.llm_provider == "anthropic",
         "persistence_enabled": settings.persistence_enabled,
     }
 
@@ -78,9 +79,13 @@ async def health() -> dict:
 @app.post("/calls", response_model=TurnResponse)
 async def start_call() -> TurnResponse:
     call_id = str(uuid.uuid4())
+    connector = get_connector(settings.isp_connector)
     orchestrator = CallOrchestrator(
-        connector=get_connector(settings.isp_connector),
+        connector=connector,
         llm=get_llm_client(settings.llm_provider, settings),
+        # Tool-calling real (§3.2/§4.3) — None quando LLM_PROVIDER != "anthropic",
+        # os handlers caem de volta para chamada direta ao conector.
+        tool_executor=get_tool_executor(settings.llm_provider, settings, connector),
         repository=_repository,
         ani="webapi",
         dnis="demo",

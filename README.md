@@ -40,7 +40,9 @@ src/voxisp/
                   HubsoftConnector (stub — ver docs/connectors/hubsoft.md),
                   resilience.py (timeout + retry + circuit breaker, §4.4)
   orchestrator/   CallOrchestrator (FSM + LLM + Connector Hub); StubLLMClient (dev) e
-                  ClaudeLLMClient (Haiku 4.5, saída estruturada) plugáveis via get_llm_client()
+                  ClaudeLLMClient (Haiku 4.5, saída estruturada) plugáveis via get_llm_client();
+                  tool_allowlist.py + tools.py + tool_executor.py — tool-calling real do Claude
+                  restrito ao allowlist de tools por estado da FSM (§3.2/§4.3)
   massive_detection.py   algoritmo de correlação de massivo (§4.5)
   voice/          interfaces de ASR/TTS (stubs — plugar Deepgram/ElevenLabs/etc.)
   telephony/      contrato da ponte de áudio (stub — plugar Asterisk/LiveKit/Pipecat)
@@ -58,7 +60,7 @@ Requer Python 3.12+.
 
 ```bash
 make install      # cria venv e instala em modo editável + deps de dev
-make test         # roda a suíte de testes (50 testes, sem infra externa — inclui SQLite in-memory)
+make test         # roda a suíte de testes (64 testes, sem infra externa — inclui SQLite in-memory)
 make up           # sobe Postgres + Redis via docker compose (só necessário com PERSISTENCE_ENABLED=true)
 make dev          # sobe a API de demonstração em http://localhost:8000
 ```
@@ -100,10 +102,18 @@ Implementado (Fase 1 do roadmap da spec, §10):
   (spec §5), escalonamento com payload de contexto (§7.3), fechamento com `duration_s`/`outcome`.
   Opcional (`PERSISTENCE_ENABLED=false` por padrão); mesmo código roda contra Postgres em produção
   ou SQLite in-memory nos testes
+- **Tool-calling real com allowlist por estado** (§3.2/§4.3): `ToolExecutor` roda um loop de
+  tool-use de verdade contra o Claude, mas só declara as tools que `tool_allowlist.py` autoriza
+  para o estado atual da FSM — nunca em SLOT_COLLECTION/CONFIRMATION, só em EXECUTION, e para
+  tools destrutivas isso só é alcançável depois da confirmação verbal (regra §7.1 #2), por
+  construção da FSM. Duas camadas de defesa: só a allowlist é declarada na request, e qualquer
+  `tool_use` fora dela é recusado sem executar o conector. Já ligado ao fluxo NET-01 (diagnóstico);
+  opcional (`LLM_PROVIDER=anthropic`), com fallback determinístico se o modelo pular uma tool
+  obrigatória
 
 Pendente — próximas fases:
 1. Preencher o `HubsoftConnector` assim que a documentação/credenciais da API chegarem (ou escrever `IXCSoftConnector`/`VoalleConnector` se o piloto for outro ERP), além dos adapters de telemetria (RADIUS, ACS, OLT/SNMP, Zabbix)
-2. Tool-calling real com allowlist de ferramentas por estado da FSM (hoje o roteamento de intent já passa pela FSM, mas o LLM ainda não chama tools diretamente)
+2. Estender o tool-calling real (hoje só em NET-01) para FIN-02/FIN-03/OPS-01, com os handlers chamando `fsm.request_action()` antes de gatilhar o `ToolExecutor`
 3. ASR/TTS de produção (Deepgram/Azure + ElevenLabs/Cartesia) e voice runtime (LiveKit Agents ou Pipecat) ligado a Asterisk/Kamailio
 4. Migração real (Alembic) em vez do `create_all` de conveniência usado hoje no boot da API
 5. Parecer jurídico formal (Decreto 11.034, RGC, LGPD) antes de qualquer go-live — ver spec §6

@@ -23,6 +23,7 @@ from voxisp.fsm.engine import CallFSM, EscalationRequired
 from voxisp.fsm.states import CallState, Intent
 from voxisp.massive_detection import check_massive_incident
 from voxisp.orchestrator.llm_client import LLMClient
+from voxisp.orchestrator.tool_executor import ToolExecutor
 
 
 def _digits_only(text: str) -> str:
@@ -81,6 +82,9 @@ class CallOrchestrator:
     ani: str = "unknown"
     dnis: str = "unknown"
     call_id: uuid.UUID | None = None
+    # Tool-calling real (§3.2/§4.3) — opcional. Sem `tool_executor`, os
+    # handlers continuam chamando o ISPConnector diretamente, como sempre.
+    tool_executor: ToolExecutor | None = None
     _transcript: list[TurnLogEntry] = field(default_factory=list)
     _diagnostics: dict[str, object] = field(default_factory=dict)
     _protocol_number: str | None = None
@@ -173,12 +177,18 @@ class CallOrchestrator:
     async def _handle_net_01(self) -> TurnResult:
         """Fluxo "estou sem internet" completo, ver exemplo em spec §7.2."""
         assert self.subscriber is not None
-        conn_status: ConnectionStatus = await self.connector.get_connection_status(self.subscriber.id)
-        self._diagnostics["NET-01.get_connection_status"] = conn_status.model_dump(mode="json")
+        # SLOT_COLLECTION -> EXECUTION: só a partir daqui as tools de
+        # diagnóstico ficam liberadas para o LLM (spec §3.2/§4.3).
+        self.fsm.request_action(Intent.NET_01_SESSION_DIAGNOSIS)
 
-        if self.subscriber.cpe_serial:
-            diag = await self.connector.get_cpe_diagnostics(self.subscriber.cpe_serial)
-            self._diagnostics["NET-02.get_cpe_diagnostics"] = diag.model_dump(mode="json")
+        if self.tool_executor is not None:
+            conn_status = await self._gather_net01_diagnostics_via_llm()
+        else:
+            conn_status = await self.connector.get_connection_status(self.subscriber.id)
+            self._diagnostics["NET-01.get_connection_status"] = conn_status.model_dump(mode="json")
+            if self.subscriber.cpe_serial:
+                diag = await self.connector.get_cpe_diagnostics(self.subscriber.cpe_serial)
+                self._diagnostics["NET-02.get_cpe_diagnostics"] = diag.model_dump(mode="json")
 
         massive = await check_massive_incident(self.connector, self.subscriber)
         if massive.is_massive and massive.incident:
@@ -220,6 +230,39 @@ class CallOrchestrator:
         self.fsm.complete_execution()
         await self._log("assistant", text)
         return TurnResult(text=text, protocol_number=protocol.protocol_number)
+
+    async def _gather_net01_diagnostics_via_llm(self) -> ConnectionStatus:
+        """Deixa o Claude decidir, dentro do allowlist de NET-01 (só
+        `get_connection_status`/`get_cpe_diagnostics`), o que consultar e em
+        que ordem — spec §3.2. O texto que o modelo escreve aqui é
+        descartado: a resposta ao cliente continua sendo montada por código
+        determinístico logo abaixo, a partir dos dados coletados."""
+        assert self.subscriber is not None and self.tool_executor is not None
+        instructions = (
+            f"Assinante {self.subscriber.name} relatou problema de internet. "
+            "Consulte o status da sessão e, se houver CPE cadastrado, o "
+            "diagnóstico óptico/Wi-Fi. Depois de coletar os dados necessários, "
+            "responda apenas 'ok' — a resposta final ao cliente é montada por "
+            "outro componente a partir dos dados que você coletou."
+        )
+        result = await self.tool_executor.run(
+            subscriber=self.subscriber,
+            intent=Intent.NET_01_SESSION_DIAGNOSIS,
+            state=self.fsm.state,
+            instructions=instructions,
+        )
+        for tool_name, payload in result.diagnostics.items():
+            self._diagnostics[f"NET-01.{tool_name}(via-llm)"] = payload
+
+        conn_payload = result.diagnostics.get("get_connection_status")
+        if conn_payload is not None:
+            return ConnectionStatus.model_validate(conn_payload)
+
+        # O modelo não chamou a tool obrigatória — degrada para chamada
+        # direta em vez de seguir sem o dado essencial do fluxo.
+        conn_status = await self.connector.get_connection_status(self.subscriber.id)
+        self._diagnostics["NET-01.get_connection_status"] = conn_status.model_dump(mode="json")
+        return conn_status
 
     async def _handle_ops_01(self) -> TurnResult:
         assert self.subscriber is not None
