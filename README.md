@@ -61,7 +61,7 @@ Requer Python 3.12+.
 
 ```bash
 make install      # cria venv e instala em modo editável + deps de dev
-make test         # roda a suíte de testes (111 testes, sem infra externa — inclui SQLite in-memory)
+make test         # roda a suíte de testes (115 testes, sem infra externa — inclui SQLite in-memory)
 make up           # sobe Postgres + Redis via docker compose (só necessário com PERSISTENCE_ENABLED=true)
 make dev          # sobe a API de demonstração em http://localhost:8000
 ```
@@ -95,9 +95,11 @@ Implementado (Fase 1 do roadmap da spec, §10):
 - **`HubsoftConnector` real** (`ISP_CONNECTOR=hubsoft`): fala com a API pública da Hubsoft — OAuth2
   password grant, `find_subscriber`/`get_invoices`/`issue_second_copy`/`request_trust_unlock`/
   `get_connection_status`/`list_service_orders`/`create_service_order`/`create_protocol` contra
-  endpoints reais verificados na documentação oficial. `get_cpe_diagnostics`/`reboot_cpe`/
-  `get_area_incidents` continuam `NotImplementedError` — **confirmado pela pesquisa** (não suposição)
-  que não existem no ERP, só em ACS/NMS. Mapeamento completo e limitações conhecidas em
+  endpoints reais verificados na documentação oficial. `olt_id` é resolvido correlacionando a PON
+  do assinante com `GET /rede/equipamento` (best-effort, nunca quebra `find_subscriber`); `cto_id`/
+  `cpe_serial` confirmadamente **não existem** em nenhum dos 3 endpoints de rede da Hubsoft — assim
+  como `get_cpe_diagnostics`/`reboot_cpe`/`get_area_incidents`, que continuam `NotImplementedError`
+  (vêm de ACS/NMS, não do ERP). Mapeamento completo e limitações conhecidas em
   [`docs/connectors/hubsoft.md`](./docs/connectors/hubsoft.md)
 - `ClaudeLLMClient` — classificador de intenção real via Claude (Haiku 4.5 por padrão, saída
   estruturada validada por schema, timeout duro de 1,5s com degradação para transbordo). Ativar com
@@ -126,7 +128,7 @@ Implementado (Fase 1 do roadmap da spec, §10):
   contrato)
 
 Pendente — próximas fases:
-1. Validar o `HubsoftConnector` contra um ambiente real do provedor piloto (a doc pública não cobre tudo — ver limitações em `docs/connectors/hubsoft.md`); resolver `olt_id`/`cto_id`/`cpe_serial` (bloqueiam NET-03 com Hubsoft); escrever `IXCSoftConnector`/`VoalleConnector` se o piloto for outro ERP; adapters de telemetria (ACS, OLT/SNMP, Zabbix) para `get_cpe_diagnostics`/`reboot_cpe`/`get_area_incidents`
+1. Validar o `HubsoftConnector` contra um ambiente real do provedor piloto (a doc pública não cobre tudo — ver limitações em `docs/connectors/hubsoft.md`); escrever `IXCSoftConnector`/`VoalleConnector` se o piloto for outro ERP; adapter de ACS para `cto_id`/`cpe_serial`/`get_cpe_diagnostics`/`reboot_cpe` e adapter de NMS para `get_area_incidents` — os dois são o que falta para destravar NET-03 com Hubsoft (`olt_id` já é resolvido via `/rede/equipamento`)
 2. Adicionar ao `ISPConnector` um método dedicado de agendar/reagendar/cancelar visita técnica, para OPS-02 parar de reaproveitar `create_service_order`
 3. ASR/TTS de produção (Deepgram/Azure + ElevenLabs/Cartesia) e voice runtime (LiveKit Agents ou Pipecat) ligado a Asterisk/Kamailio
 4. Migração real (Alembic) em vez do `create_all` de conveniência usado hoje no boot da API

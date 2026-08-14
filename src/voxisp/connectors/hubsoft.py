@@ -136,6 +136,12 @@ class HubsoftConnector(ISPConnector):
     - Diagnóstico/reboot de CPE e correlação de incidente de rede
       (`get_cpe_diagnostics`, `reboot_cpe`, `get_area_incidents`) não
       existem na Hubsoft — vêm de ACS/NMS, fora do escopo deste conector.
+    - `olt_id` é resolvido correlacionando `servicos[].interface.nome` (a
+      PON do assinante, ex. "PON5") com `GET /rede/equipamento`: cada
+      equipamento tem uma lista de `interfaces[]`, e o equipamento dono da
+      interface com esse nome é a OLT. `cto_id`/`cpe_serial` continuam
+      indisponíveis — confirmado que não aparecem em `/rede/equipamento`,
+      `/rede/pop` nem `/rede/zona_atendimento` (ver docs/connectors/hubsoft.md).
     """
 
     def __init__(self, settings: Settings, client: httpx.AsyncClient | None = None) -> None:
@@ -158,6 +164,11 @@ class HubsoftConnector(ISPConnector):
         self._base_url = settings.hubsoft_base_url.rstrip("/")
         self._client = client or httpx.AsyncClient()
         self._breaker = CircuitBreaker()
+        # Breaker isolado para a resolução de OLT (rede/equipamento): é um
+        # enriquecimento best-effort, não pode derrubar o breaker principal
+        # e travar chamadas críticas (financeiro, sessão) — spec §4.4,
+        # "degradação graciosa".
+        self._equipment_breaker = CircuitBreaker()
         self._access_token: str | None = None
         self._token_expires_at: datetime | None = None
         # Caches internos (por instância) para contornar lacunas da API real
@@ -165,6 +176,7 @@ class HubsoftConnector(ISPConnector):
         self._subscriber_cache: dict[str, Subscriber] = {}
         self._login_by_subscriber: dict[str, str] = {}
         self._invoice_cache: dict[str, dict] = {}
+        self._equipamento_cache: list[dict] | None = None
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -213,11 +225,15 @@ class HubsoftConnector(ISPConnector):
         params: dict | None = None,
         json_body: dict | None = None,
         max_retries: int = 0,
+        breaker: CircuitBreaker | None = None,
     ) -> dict:
         """`max_retries=0` por padrão: chamadas que mutam estado (POST) não
         devem ser repetidas automaticamente sem idempotência garantida pela
-        API real (spec §5) — quem faz GET explicitamente pede mais retries."""
+        API real (spec §5) — quem faz GET explicitamente pede mais retries.
+        `breaker` permite isolar chamadas não-críticas (ex.: resolução de
+        OLT) do circuit breaker principal."""
         await self._ensure_token()
+        breaker = breaker or self._breaker
 
         async def _do_call() -> httpx.Response:
             headers = {"Accept": "application/json", "Authorization": f"Bearer {self._access_token}"}
@@ -225,7 +241,7 @@ class HubsoftConnector(ISPConnector):
                 method, f"{self._base_url}{path}", params=params, json=json_body, headers=headers
             )
 
-        response = await call_with_resilience(_do_call, breaker=self._breaker, max_retries=max_retries)
+        response = await call_with_resilience(_do_call, breaker=breaker, max_retries=max_retries)
 
         if response.status_code == 401:
             # Token pode ter expirado antes do previsto — reautentica uma vez.
@@ -266,6 +282,8 @@ class HubsoftConnector(ISPConnector):
 
         raw = clientes[0]
         subscriber = self._parse_subscriber(raw)
+        if subscriber.pon:
+            subscriber.olt_id = await self._resolve_olt_id(subscriber.pon)
         self._subscriber_cache[subscriber.id] = subscriber
         servicos = raw.get("servicos") or []
         login = servicos[0].get("login") if servicos else None
@@ -297,16 +315,47 @@ class HubsoftConnector(ISPConnector):
             # se há campo em outro endpoint (contrato?) quando formos usar FIN-04.
             loyalty_until=None,
             address=endereco.get("completo", ""),
-            # TODO(hubsoft-docs): olt_id/cto_id não vêm em /cliente — a
-            # correlação de massivo (NET-03) vai precisar de
-            # rede/equipamento.rst ou rede/pop.rst para resolver isso a
-            # partir do `interface` do serviço.
+            # olt_id é preenchido de forma assíncrona em find_subscriber()
+            # (_resolve_olt_id), depois deste parse síncrono — não dá pra
+            # resolver aqui dentro porque exige uma chamada HTTP adicional.
             olt_id=None,
             pon=interface.get("nome"),
+            # CONFIRMADO (não suposição): cto_id não aparece em
+            # /rede/equipamento, /rede/pop nem /rede/zona_atendimento — a
+            # Hubsoft não expõe granularidade de CTO/caixa de emenda nesses
+            # três endpoints. Fica pendente até acharmos outro endpoint ou
+            # aceitarmos que vem só do NMS.
             cto_id=None,
-            # CPE/ONU fica no ACS, não no ERP — spec §4.4, confirmado pela pesquisa.
+            # CPE/ONU fica no ACS, não no ERP — spec §4.4, confirmado pela
+            # pesquisa (nenhum dos 3 endpoints de rede/ tem serial de ONU).
             cpe_serial=None,
         )
+
+    async def _resolve_olt_id(self, pon_interface_name: str) -> str | None:
+        """Correlaciona a PON do assinante (`servicos[].interface.nome`,
+        ex. "PON5") com `GET /rede/equipamento`: o equipamento que tem uma
+        interface com esse nome é a OLT. Best-effort — nunca derruba
+        `find_subscriber` se a API de rede falhar (§4.4, degradação graciosa)."""
+        try:
+            equipamentos = await self._get_equipamentos()
+        except Exception:  # noqa: BLE001 - enriquecimento opcional, nunca propaga (§4.4)
+            return None
+        for equipamento in equipamentos:
+            for interface in equipamento.get("interfaces") or []:
+                if interface.get("nome") == pon_interface_name:
+                    return str(equipamento.get("id_equipamento"))
+        return None
+
+    async def _get_equipamentos(self) -> list[dict]:
+        if self._equipamento_cache is None:
+            data = await self._request(
+                "GET",
+                "/api/v1/integracao/rede/equipamento",
+                max_retries=1,
+                breaker=self._equipment_breaker,
+            )
+            self._equipamento_cache = data.get("equipamentos") or []
+        return self._equipamento_cache
 
     async def get_invoices(self, subscriber_id: str, status: str) -> list[Invoice]:
         data = await self._request(

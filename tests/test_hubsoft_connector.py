@@ -2,6 +2,7 @@
 simulando as respostas documentadas em docs.hubsoft.com.br /
 github.com/hubsoftbrasil/api (payloads copiados dos exemplos oficiais).
 """
+import json as _json
 from datetime import date
 
 import httpx
@@ -97,6 +98,34 @@ ORDENS_SERVICO_RESPONSE = {
     ],
 }
 
+# Payload real de exemplo — rede/equipamento.rst, com uma interface "PON5"
+# que casa com CLIENTE_RESPONSE (servicos[].interface.nome) — é a
+# correlação que _resolve_olt_id() faz.
+EQUIPAMENTO_RESPONSE = {
+    "status": "success",
+    "msg": "Dados consultados com sucesso.",
+    "equipamentos": [
+        {
+            "id_equipamento": 1410,
+            "nome": "OLT BDCOM",
+            "ipv4": "177.52.48.7",
+            "modelo": "GP3600-08",
+            "fabricante": "BDCOM",
+            "interfaces": [{"id_interface_conexao": 355, "nome": "PON5", "tipo": "gpon"}],
+        },
+        {
+            "id_equipamento": 1406,
+            "nome": "JUNIPER-MX104",
+            "ipv4": "10.20.1.114",
+            "modelo": "MX104",
+            "fabricante": "JUNIPER",
+            "interfaces": [],
+        },
+    ],
+}
+
+EQUIPAMENTO_RESPONSE_EMPTY = {"status": "success", "msg": "Dados consultados com sucesso.", "equipamentos": []}
+
 
 def _configured_settings(**overrides) -> Settings:
     defaults = {
@@ -127,6 +156,20 @@ def _connector_with(data_handler) -> HubsoftConnector:
     return HubsoftConnector(_configured_settings(), client=client)
 
 
+def _with_empty_equipamentos(data_handler):
+    """Envolve um handler de teste para responder `/rede/equipamento` com
+    uma lista vazia — usado em testes cujo foco não é resolução de OLT
+    (find_subscriber sempre dispara essa chamada; sem branch explícito, o
+    handler original quebraria o assert de outro endpoint)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/integracao/rede/equipamento":
+            return httpx.Response(200, json=EQUIPAMENTO_RESPONSE_EMPTY)
+        return data_handler(request)
+
+    return handler
+
+
 def test_hubsoft_implements_protocol():
     assert isinstance(_connector_with(lambda r: pytest.fail("não deveria chamar a API")), ISPConnector)
 
@@ -150,6 +193,8 @@ def test_factory_wires_hubsoft_connector():
 
 async def test_find_subscriber_parses_real_payload():
     def data_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/integracao/rede/equipamento":
+            return httpx.Response(200, json=EQUIPAMENTO_RESPONSE_EMPTY)
         assert request.url.path == "/api/v1/integracao/cliente"
         assert request.url.params["busca"] == "cpf_cnpj"
         assert request.url.params["termo_busca"] == "10682083681"
@@ -168,9 +213,10 @@ async def test_find_subscriber_parses_real_payload():
     assert subscriber.pon == "PON5"
     assert subscriber.contract_start.isoformat() == "2017-08-05"
     assert "***" in subscriber.cpf_masked  # nunca CPF em claro (LGPD §6.3)
-    # Campos que o Hubsoft não expõe em /cliente — documentado como TODO.
+    # Confirmado que não existem em /rede/equipamento, /rede/pop nem
+    # /rede/zona_atendimento — ver docs/connectors/hubsoft.md.
     assert subscriber.cpe_serial is None
-    assert subscriber.olt_id is None
+    assert subscriber.cto_id is None
 
 
 async def test_find_subscriber_returns_none_when_empty():
@@ -184,6 +230,63 @@ async def test_find_subscriber_returns_none_when_empty():
 async def test_find_subscriber_without_cpf_or_phone_returns_none_without_calling_api():
     connector = _connector_with(lambda r: pytest.fail("não deveria chamar a API"))
     assert await connector.find_subscriber() is None
+
+
+# -- resolução de OLT via rede/equipamento -----------------------------------
+
+
+async def test_find_subscriber_resolves_olt_id_from_matching_interface():
+    def data_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/integracao/rede/equipamento":
+            return httpx.Response(200, json=EQUIPAMENTO_RESPONSE)
+        return httpx.Response(200, json=CLIENTE_RESPONSE)
+
+    connector = _connector_with(data_handler)
+    subscriber = await connector.find_subscriber(cpf="10682083681")
+
+    assert subscriber is not None
+    assert subscriber.pon == "PON5"
+    assert subscriber.olt_id == "1410"  # id_equipamento da OLT dona da interface PON5
+
+
+async def test_find_subscriber_olt_id_none_when_no_interface_matches():
+    connector = _connector_with(_with_empty_equipamentos(lambda r: httpx.Response(200, json=CLIENTE_RESPONSE)))
+    subscriber = await connector.find_subscriber(cpf="10682083681")
+
+    assert subscriber is not None
+    assert subscriber.olt_id is None
+
+
+async def test_find_subscriber_olt_resolution_degrades_gracefully_on_failure():
+    """Se /rede/equipamento falhar, find_subscriber não quebra — a
+    resolução de OLT é um enriquecimento best-effort (§4.4)."""
+
+    def data_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/integracao/rede/equipamento":
+            return httpx.Response(500, text="erro interno simulado")
+        return httpx.Response(200, json=CLIENTE_RESPONSE)
+
+    connector = _connector_with(data_handler)
+    subscriber = await connector.find_subscriber(cpf="10682083681")
+
+    assert subscriber is not None
+    assert subscriber.olt_id is None
+
+
+async def test_equipamento_list_is_cached_across_find_subscriber_calls():
+    call_count = {"equipamento": 0}
+
+    def data_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/integracao/rede/equipamento":
+            call_count["equipamento"] += 1
+            return httpx.Response(200, json=EQUIPAMENTO_RESPONSE)
+        return httpx.Response(200, json=CLIENTE_RESPONSE)
+
+    connector = _connector_with(data_handler)
+    await connector.find_subscriber(cpf="10682083681")
+    await connector.find_subscriber(cpf="10682083681")
+
+    assert call_count["equipamento"] == 1
 
 
 # -- get_invoices / issue_second_copy ---------------------------------------
@@ -274,6 +377,8 @@ async def test_get_connection_status_requires_prior_find_subscriber():
 
 async def test_get_connection_status_online():
     def data_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/integracao/rede/equipamento":
+            return httpx.Response(200, json=EQUIPAMENTO_RESPONSE_EMPTY)
         if request.url.path == "/api/v1/integracao/cliente":
             return httpx.Response(200, json=CLIENTE_RESPONSE)
         assert request.url.path == "/api/v1/integracao/cliente/extrato_conexao"
@@ -298,6 +403,8 @@ async def test_get_connection_status_online():
 
 async def test_get_connection_status_offline():
     def data_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/integracao/rede/equipamento":
+            return httpx.Response(200, json=EQUIPAMENTO_RESPONSE_EMPTY)
         if request.url.path == "/api/v1/integracao/cliente":
             return httpx.Response(200, json=CLIENTE_RESPONSE)
         return httpx.Response(
@@ -356,11 +463,11 @@ async def test_list_service_orders_maps_status_and_technician():
 
 async def test_create_service_order_via_atendimento_endpoint():
     def data_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/integracao/rede/equipamento":
+            return httpx.Response(200, json=EQUIPAMENTO_RESPONSE_EMPTY)
         if request.url.path == "/api/v1/integracao/cliente":
             return httpx.Response(200, json=CLIENTE_RESPONSE)
         assert request.url.path == "/api/v1/integracao/atendimento"
-        import json as _json
-
         body = _json.loads(request.read())
         assert body["abrir_os"] is True
         assert body["id_cliente_servico"] == "11201"
@@ -387,10 +494,10 @@ async def test_create_service_order_via_atendimento_endpoint():
 
 async def test_create_protocol_via_atendimento_endpoint():
     def data_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/integracao/rede/equipamento":
+            return httpx.Response(200, json=EQUIPAMENTO_RESPONSE_EMPTY)
         if request.url.path == "/api/v1/integracao/cliente":
             return httpx.Response(200, json=CLIENTE_RESPONSE)
-        import json as _json
-
         body = _json.loads(request.read())
         assert body.get("abrir_os") is None  # create_protocol não abre OS
         return httpx.Response(200, json={"status": "success", "protocolo": "201811161058216"})

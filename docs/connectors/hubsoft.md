@@ -36,6 +36,7 @@ reautentica sozinho quando o token expira ou quando o servidor devolve 401.
 | `create_service_order` | `POST /api/v1/integracao/atendimento` (`abrir_os=true`) | **Não há endpoint de "criar OS" isolado** — `ordem_servico/agendar` só *agenda* uma OS que já existe. A criação de fato acontece pelo endpoint de atendimento |
 | `get_area_incidents` | **não existe na Hubsoft** | Confirmado — vem do NMS (Zabbix/OLT SNMP), correlação feita em `massive_detection.py` |
 | `create_protocol` | `POST /api/v1/integracao/atendimento` (sem `abrir_os`) | Mesmo endpoint de `create_service_order`, variando o payload — os dois convergem porque `atendimento` é o objeto que carrega o `protocolo` |
+| `Subscriber.olt_id` (dentro de `find_subscriber`) | `GET /api/v1/integracao/rede/equipamento` | Sem endpoint dedicado — correlaciona `servicos[].interface.nome` (a PON do assinante, ex. `"PON5"`) com `equipamentos[].interfaces[].nome`; o equipamento dono é a OLT. Lista de equipamentos cacheada por instância (não muda por chamada); circuit breaker isolado (`_equipment_breaker`) para nunca travar chamadas críticas se `/rede/equipamento` cair |
 
 **Confirmação da hipótese arquitetural original:** `get_cpe_diagnostics`,
 `reboot_cpe` e `get_area_incidents` genuinamente não existem na Hubsoft —
@@ -47,13 +48,21 @@ vez de um único `ISPConnector`.
 
 ## Limitações conhecidas desta implementação (documentadas em `# TODO` no código)
 
-- **`Subscriber.olt_id`/`cto_id`/`cpe_serial`**: não vêm em
-  `GET /cliente`. `pon` vem parcialmente (`servicos[].interface.nome`, ex.
-  `"PON5"`), mas `olt_id`/`cto_id` exigiriam correlacionar com
-  `rede/equipamento.rst`/`rede/pop.rst` — não explorado ainda. Sem isso,
-  **NET-03 (correlação de massivo) não funciona com `HubsoftConnector`** —
-  só com `MockISPConnector` por enquanto, já que `get_area_incidents`
-  também não existe no ERP.
+- **`Subscriber.olt_id` — resolvido.** `find_subscriber` correlaciona
+  `servicos[].interface.nome` (a PON do assinante) com
+  `GET /rede/equipamento` para achar o `id_equipamento` da OLT dona
+  daquela interface. Best-effort: se `/rede/equipamento` falhar ou não
+  houver interface correspondente, `olt_id` fica `None` sem quebrar
+  `find_subscriber` (§4.4, degradação graciosa).
+- **`Subscriber.cto_id`/`cpe_serial` — confirmado que não dá para
+  resolver com a Hubsoft.** Pesquisei os 3 endpoints de `rede/`
+  (`equipamento`, `pop`, `zona_atendimento`) e nenhum expõe granularidade
+  de CTO/caixa de emenda nem serial de ONU/CPE — não é falta de
+  exploração, é ausência confirmada nesses payloads. `cpe_serial`
+  provavelmente vem só do ACS (GenieACS/Aprecomm), como o restante do
+  diagnóstico de CPE. **Sem `cto_id`/`get_area_incidents`, NET-03
+  (correlação de massivo) continua sem funcionar com `HubsoftConnector`**
+  — só com `MockISPConnector` por enquanto.
 - **`Subscriber.loyalty_until`** (fidelidade contratual, spec FIN-04): não
   encontrado em `GET /cliente`. Pode estar em um endpoint de contrato não
   mapeado ainda.
@@ -79,7 +88,10 @@ vez de um único `ISPConnector`.
    (`tests/test_mock_connector.py`) contra o `HubsoftConnector` em modo
    integração (fora do CI, com credenciais reais) para validar os campos
    que a doc pública não cobre por completo
-3. Resolver `olt_id`/`cto_id`/`cpe_serial` via `rede/equipamento.rst` ou
-   confirmar que vêm de um adapter de ACS separado
-4. Validar o formato exato de `ordens_servico[]` em `POST /atendimento`
+3. Validar a resolução de `olt_id` (via `/rede/equipamento`) contra o
+   volume real de PONs do provedor — a correlação por nome de interface
+   pode não ser 1:1 dependendo de como o provedor nomeia suas interfaces
+4. Definir de onde vem `cto_id`/`cpe_serial` (provavelmente ACS — ver
+   `docs/connectors/` quando o adapter for escrito) para destravar NET-03
+5. Validar o formato exato de `ordens_servico[]` em `POST /atendimento`
    com `abrir_os=true` contra uma resposta real
