@@ -15,7 +15,7 @@ from pydantic import BaseModel
 from voxisp.config import settings
 from voxisp.connectors import get_connector
 from voxisp.observability.logging import configure_logging, get_logger
-from voxisp.orchestrator import CallOrchestrator, StubLLMClient
+from voxisp.orchestrator import CallOrchestrator, get_llm_client
 
 configure_logging()
 logger = get_logger(__name__)
@@ -46,13 +46,16 @@ class TurnResponse(BaseModel):
 
 @app.get("/health")
 async def health() -> dict:
-    return {"status": "ok", "isp_connector": settings.isp_connector}
+    return {"status": "ok", "isp_connector": settings.isp_connector, "llm_provider": settings.llm_provider}
 
 
 @app.post("/calls", response_model=TurnResponse)
 async def start_call() -> TurnResponse:
     call_id = str(uuid.uuid4())
-    orchestrator = CallOrchestrator(connector=get_connector(settings.isp_connector), llm=StubLLMClient())
+    orchestrator = CallOrchestrator(
+        connector=get_connector(settings.isp_connector),
+        llm=get_llm_client(settings.llm_provider, settings),
+    )
     _SESSIONS[call_id] = orchestrator
     result = await orchestrator.greet()
     logger.info("call_started", call_id=call_id)

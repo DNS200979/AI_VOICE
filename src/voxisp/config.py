@@ -24,9 +24,9 @@ class Settings(BaseSettings):
     tts_provider: str = "stub"
     tts_api_key: str = ""
 
-    llm_provider: str = "stub"
+    llm_provider: str = "stub"  # stub | anthropic
     llm_api_key: str = ""
-    llm_model: str = "claude-haiku-4-5-20251001"
+    llm_model: str = "claude-haiku-4-5"
 
     ari_url: str = "http://localhost:8088/ari"
     ari_user: str = "voxisp"

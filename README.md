@@ -39,7 +39,8 @@ src/voxisp/
   connectors/     ISPConnector (Protocol), modelos Pydantic, MockISPConnector,
                   HubsoftConnector (stub — ver docs/connectors/hubsoft.md),
                   resilience.py (timeout + retry + circuit breaker, §4.4)
-  orchestrator/   CallOrchestrator (FSM + LLM + Connector Hub) e cliente LLM plugável
+  orchestrator/   CallOrchestrator (FSM + LLM + Connector Hub); StubLLMClient (dev) e
+                  ClaudeLLMClient (Haiku 4.5, saída estruturada) plugáveis via get_llm_client()
   massive_detection.py   algoritmo de correlação de massivo (§4.5)
   voice/          interfaces de ASR/TTS (stubs — plugar Deepgram/ElevenLabs/etc.)
   telephony/      contrato da ponte de áudio (stub — plugar Asterisk/LiveKit/Pipecat)
@@ -83,10 +84,14 @@ Implementado (Fase 1 do roadmap da spec, §10):
 - Camada de resiliência (`resilience.py`): timeout, retry com backoff, circuit breaker (§4.4)
 - `HubsoftConnector` **stubado**, plugado na fábrica (`ISP_CONNECTOR=hubsoft`), esperando a
   documentação da API — checklist completo em [`docs/connectors/hubsoft.md`](./docs/connectors/hubsoft.md)
+- `ClaudeLLMClient` — classificador de intenção real via Claude (Haiku 4.5 por padrão, saída
+  estruturada validada por schema, timeout duro de 1,5s com degradação para transbordo). Ativar com
+  `LLM_PROVIDER=anthropic` + `LLM_API_KEY` no `.env`; `StubLLMClient` (keyword, sem rede) continua
+  como padrão em dev/CI
 
 Pendente — próximas fases:
 1. Preencher o `HubsoftConnector` assim que a documentação/credenciais da API chegarem (ou escrever `IXCSoftConnector`/`VoalleConnector` se o piloto for outro ERP), além dos adapters de telemetria (RADIUS, ACS, OLT/SNMP, Zabbix)
-2. LLM real com prompt caching (substituir `StubLLMClient`) e tool-calling com allowlist por estado
+2. Tool-calling real com allowlist de ferramentas por estado da FSM (hoje o roteamento de intent já passa pela FSM, mas o LLM ainda não chama tools diretamente)
 3. ASR/TTS de produção (Deepgram/Azure + ElevenLabs/Cartesia) e voice runtime (LiveKit Agents ou Pipecat) ligado a Asterisk/Kamailio
 4. Persistência real (SQLAlchemy + Postgres) das tabelas `call`/`turn`/`action`/`escalation`
 5. Parecer jurídico formal (Decreto 11.034, RGC, LGPD) antes de qualquer go-live — ver spec §6
