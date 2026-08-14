@@ -23,8 +23,8 @@ CallOrchestrator  ── FSM (CallFSM) decide estado/transições e regras invio
 StubLLMClient (classificador por keyword — trocar por Claude Haiku/GPT-4o-mini/Gemini Flash)
         │
         ▼
-ISPConnector (Protocol) ── MockISPConnector (dev/teste)
-        │                   └─ implementações reais: Hubsoft, IXC, SGP, Voalle, MK (a construir)
+ISPConnector (Protocol) ── MockISPConnector (dev/teste) · HubsoftConnector (real)
+        │                   └─ IXC, SGP, Voalle, MK: ainda por construir
         ▼
 check_massive_incident()  ── correlação PON→LOS→incidente (spec §4.5, maior ROI do produto)
 ```
@@ -37,8 +37,9 @@ A árvore completa de arquitetura (borda telefônica, voice runtime, orçamento 
 src/voxisp/
   fsm/            máquina de estados + catálogo de intents + regras invioláveis (§7.1)
   connectors/     ISPConnector (Protocol), modelos Pydantic, MockISPConnector,
-                  HubsoftConnector (stub — ver docs/connectors/hubsoft.md),
-                  resilience.py (timeout + retry + circuit breaker, §4.4)
+                  HubsoftConnector (real, contra API pública documentada —
+                  ver docs/connectors/hubsoft.md), resilience.py (timeout +
+                  retry + circuit breaker, §4.4)
   orchestrator/   CallOrchestrator (FSM + LLM + Connector Hub); StubLLMClient (dev) e
                   ClaudeLLMClient (Haiku 4.5, saída estruturada) plugáveis via get_llm_client();
                   tool_allowlist.py + tools.py + tool_executor.py — tool-calling real do Claude
@@ -60,7 +61,7 @@ Requer Python 3.12+.
 
 ```bash
 make install      # cria venv e instala em modo editável + deps de dev
-make test         # roda a suíte de testes (83 testes, sem infra externa — inclui SQLite in-memory)
+make test         # roda a suíte de testes (111 testes, sem infra externa — inclui SQLite in-memory)
 make up           # sobe Postgres + Redis via docker compose (só necessário com PERSISTENCE_ENABLED=true)
 make dev          # sobe a API de demonstração em http://localhost:8000
 ```
@@ -85,14 +86,19 @@ Copie `.env.example` para `.env` para ajustar conector/providers.
 
 Implementado (Fase 1 do roadmap da spec, §10):
 - FSM com as 6 regras invioláveis do §7.1 (transbordo em 1 palavra, confirmação de ação destrutiva, limites de falha de reconhecimento e de turnos sem progresso)
-- `ISPConnector` (interface) + `MockISPConnector` (dados de demonstração, inclui cenário de massivo)
+- `ISPConnector` (interface) + `MockISPConnector` (dados de demonstração, inclui cenário de massivo) + `HubsoftConnector` (real)
 - Identificação por CPF com validação de dígito verificador
 - Intents FIN-02, FIN-03, NET-01→04, OPS-01→03 (fluxo completo do exemplo NET-01 em §7.2)
 - Payload de transbordo contextualizado (§7.3)
 - Modelo de dados (§8) como SQL pronto para Postgres
 - Camada de resiliência (`resilience.py`): timeout, retry com backoff, circuit breaker (§4.4)
-- `HubsoftConnector` **stubado**, plugado na fábrica (`ISP_CONNECTOR=hubsoft`), esperando a
-  documentação da API — checklist completo em [`docs/connectors/hubsoft.md`](./docs/connectors/hubsoft.md)
+- **`HubsoftConnector` real** (`ISP_CONNECTOR=hubsoft`): fala com a API pública da Hubsoft — OAuth2
+  password grant, `find_subscriber`/`get_invoices`/`issue_second_copy`/`request_trust_unlock`/
+  `get_connection_status`/`list_service_orders`/`create_service_order`/`create_protocol` contra
+  endpoints reais verificados na documentação oficial. `get_cpe_diagnostics`/`reboot_cpe`/
+  `get_area_incidents` continuam `NotImplementedError` — **confirmado pela pesquisa** (não suposição)
+  que não existem no ERP, só em ACS/NMS. Mapeamento completo e limitações conhecidas em
+  [`docs/connectors/hubsoft.md`](./docs/connectors/hubsoft.md)
 - `ClaudeLLMClient` — classificador de intenção real via Claude (Haiku 4.5 por padrão, saída
   estruturada validada por schema, timeout duro de 1,5s com degradação para transbordo). Ativar com
   `LLM_PROVIDER=anthropic` + `LLM_API_KEY` no `.env`; `StubLLMClient` (keyword, sem rede) continua
@@ -120,7 +126,7 @@ Implementado (Fase 1 do roadmap da spec, §10):
   contrato)
 
 Pendente — próximas fases:
-1. Preencher o `HubsoftConnector` assim que a documentação/credenciais da API chegarem (ou escrever `IXCSoftConnector`/`VoalleConnector` se o piloto for outro ERP), além dos adapters de telemetria (RADIUS, ACS, OLT/SNMP, Zabbix)
+1. Validar o `HubsoftConnector` contra um ambiente real do provedor piloto (a doc pública não cobre tudo — ver limitações em `docs/connectors/hubsoft.md`); resolver `olt_id`/`cto_id`/`cpe_serial` (bloqueiam NET-03 com Hubsoft); escrever `IXCSoftConnector`/`VoalleConnector` se o piloto for outro ERP; adapters de telemetria (ACS, OLT/SNMP, Zabbix) para `get_cpe_diagnostics`/`reboot_cpe`/`get_area_incidents`
 2. Adicionar ao `ISPConnector` um método dedicado de agendar/reagendar/cancelar visita técnica, para OPS-02 parar de reaproveitar `create_service_order`
 3. ASR/TTS de produção (Deepgram/Azure + ElevenLabs/Cartesia) e voice runtime (LiveKit Agents ou Pipecat) ligado a Asterisk/Kamailio
 4. Migração real (Alembic) em vez do `create_all` de conveniência usado hoje no boot da API

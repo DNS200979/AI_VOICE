@@ -1,63 +1,85 @@
-# HubsoftConnector — checklist de implementação
+# HubsoftConnector
 
-`src/voxisp/connectors/hubsoft.py` está **stubado**: implementa o `Protocol`
-`ISPConnector`, já plugado na fábrica (`get_connector("hubsoft")`) e na
-camada de resiliência (`resilience.py`), mas cada método levanta
-`NotImplementedError` até a documentação/credenciais reais da API Hubsoft
-chegarem. Este documento é o checklist do que falta preencher.
+`src/voxisp/connectors/hubsoft.py` fala com a API real da Hubsoft. Os
+endpoints, formatos de request/response e particularidades abaixo foram
+**verificados** contra a documentação oficial:
 
-## O que precisamos da Hubsoft
+- https://docs.hubsoft.com.br/
+- https://github.com/hubsoftbrasil/api (fonte `.rst` da doc acima —
+  usado aqui porque é navegável arquivo a arquivo)
 
-- [ ] Documentação da API (REST? GraphQL?) — endpoint base, versão
-- [ ] Método de autenticação (assumido: OAuth2 `client_credentials` —
-      confirmar; hoje `config.py` tem `hubsoft_client_id`/`hubsoft_client_secret`)
-- [ ] Ambiente de sandbox/homologação com dados de teste
-- [ ] Rate limits e política de paginação
-- [ ] Confirmação de quais dos endpoints abaixo existem e seus schemas reais
+Isso substitui o checklist hipotético da v1 deste documento: não é mais
+suposição, é o contrato real. O que ainda falta é acesso a um ambiente de
+homologação real do provedor piloto para validar contra dados de produção
+(a doc pública não substitui isso).
 
-## Mapeamento intent → endpoint (hipótese a validar)
+## Autenticação
 
-| Método do `ISPConnector` | Endpoint Hubsoft (hipótese) | Observações |
+OAuth2 "password grant": `POST {base_url}/oauth/token` com `grant_type`,
+`client_id`, `client_secret`, `username`, `password` — as 4 credenciais
+(além da URL) exigidas em `.env` (`HUBSOFT_*`). Resposta traz `access_token`
+Bearer válido por `expires_in` segundos (~30 dias na prática). O conector
+reautentica sozinho quando o token expira ou quando o servidor devolve 401.
+
+## Mapeamento intent/método → endpoint (confirmado)
+
+| Método do `ISPConnector` | Endpoint real | Observações |
 |---|---|---|
-| `find_subscriber` | `GET /clientes?cpf=...` ou `?telefone=...` | Confirmar campo de busca e se retorna múltiplos contratos por CPF |
-| `get_invoices` | `GET /clientes/{id}/faturas?status=...` | Confirmar enum de status da Hubsoft vs. `InvoiceStatus` nosso |
-| `issue_second_copy` | `POST /faturas/{id}/segunda-via` | Confirmar se retorna PIX copia-e-cola pronto ou só linha digitável (pode exigir geração de PIX à parte via PSP) |
-| `request_trust_unlock` | `POST /clientes/{id}/desbloqueio-confianca` | Confirmar regra de elegibilidade nativa do ERP (nº de desbloqueios/mês etc. — spec FIN-03) |
-| `get_connection_status` | `GET /clientes/{id}/sessao-radius` (ou via AAA separado) | Pode não existir na Hubsoft — pode precisar vir do `FreeRADIUSAdapter` (radacct) direto, não do ERP |
-| `get_cpe_diagnostics` | Provavelmente **fora do Hubsoft** — vem do ACS (GenieACS/Aprecomm), não do ERP |
-| `reboot_cpe` | Idem — TR-069 via ACS, não via Hubsoft |
-| `list_service_orders` / `create_service_order` | `GET/POST /clientes/{id}/os` | Confirmar categorias de OS aceitas pela Hubsoft para pré-triagem (OPS-03) |
-| `get_area_incidents` | Provavelmente **fora do Hubsoft** — vem do NMS (Zabbix/OLT SNMP), correlação feita em `massive_detection.py` |
-| `create_protocol` | `POST /protocolos` ou gerado localmente e só registrado na Hubsoft | Confirmar se a Hubsoft emite protocolo nativamente (exigência regulatória §6.1) |
+| `find_subscriber` | `GET /api/v1/integracao/cliente` (`busca=cpf_cnpj\|telefone`) | `Subscriber.id` = `id_cliente_servico` do primeiro serviço da lista (não `id_cliente` — um cliente pode ter vários serviços/planos; a v1 assume um) |
+| `get_invoices` | `GET /api/v1/integracao/cliente/financeiro` (`busca=id_cliente_servico`) | Hubsoft não devolve um campo de status — inferido a partir de `data_pagamento` + vencimento |
+| `issue_second_copy` | *nenhum endpoint dedicado* | `pix_copia_cola`/`linha_digitavel` já vêm no payload de `get_invoices` — o conector cacheia por `id_fatura` e resolve daí. **Não existe busca de fatura avulsa por `id_fatura`** — por isso `issue_second_copy` exige que `get_invoices` já tenha rodado nesta mesma instância |
+| `request_trust_unlock` | `POST /api/v1/integracao/cliente/desbloqueio_confianca` | `dias_desbloqueio=2` (48h, spec FIN-03). Resposta não tem campo booleano de elegibilidade — inferido de `status != "success"` |
+| `get_connection_status` | `GET /api/v1/integracao/cliente/extrato_conexao` (`busca=login`) | Busca por **login RADIUS**, não pelo id do assinante — o login vem de `servicos[].login` em `find_subscriber` e fica cacheado internamente. Online/offline inferido de `acctstoptime` (null = ainda conectado) |
+| `get_cpe_diagnostics` | **não existe na Hubsoft** | Confirmado pela pesquisa — vem do ACS (GenieACS/Aprecomm), fora do ERP |
+| `reboot_cpe` | **não existe na Hubsoft** | Idem — TR-069 via ACS |
+| `list_service_orders` | `GET /api/v1/integracao/cliente/ordem_servico` (`busca=id_cliente_servico`) | Status da Hubsoft é texto livre em português (`"aguardando_agendamento"`, `"finalizado"` etc.) — mapeado para `ServiceOrderStatus` via tabela; valores não mapeados caem em `OPEN` |
+| `create_service_order` | `POST /api/v1/integracao/atendimento` (`abrir_os=true`) | **Não há endpoint de "criar OS" isolado** — `ordem_servico/agendar` só *agenda* uma OS que já existe. A criação de fato acontece pelo endpoint de atendimento |
+| `get_area_incidents` | **não existe na Hubsoft** | Confirmado — vem do NMS (Zabbix/OLT SNMP), correlação feita em `massive_detection.py` |
+| `create_protocol` | `POST /api/v1/integracao/atendimento` (sem `abrir_os`) | Mesmo endpoint de `create_service_order`, variando o payload — os dois convergem porque `atendimento` é o objeto que carrega o `protocolo` |
 
-**Implicação arquitetural:** parte destas chamadas (ACS, RADIUS, NMS) não
-deve vir do `HubsoftConnector` — o ERP não sabe de RX power de ONU. Quando a
-doc chegar, provável que `get_cpe_diagnostics`/`reboot_cpe`/`get_area_incidents`
-migrem para adapters de telemetria separados (`GenieACSAdapter`,
-`FreeRADIUSAdapter`, `OLTSnmpAdapter` — spec §4.4) e o `CallOrchestrator`
-passe a receber os dois (`HubsoftConnector` + adapters) em vez de um único
-objeto. Isso é decisão de composição, não de interface — o `Protocol`
-`ISPConnector` atual é suficiente para começar.
+**Confirmação da hipótese arquitetural original:** `get_cpe_diagnostics`,
+`reboot_cpe` e `get_area_incidents` genuinamente não existem na Hubsoft —
+não é suposição, é o que a doc real mostra. Quando esses três forem
+implementados, entram como adapters de telemetria separados
+(`GenieACSAdapter`, `OLTSnmpAdapter`/`ZabbixAdapter`, spec §4.4), com o
+`CallOrchestrator`/`ToolExecutor` recebendo os dois (Hubsoft + adapter) em
+vez de um único `ISPConnector`.
 
-## Idempotência (ações destrutivas)
+## Limitações conhecidas desta implementação (documentadas em `# TODO` no código)
 
-`reboot_cpe`, `request_trust_unlock` e qualquer alteração de vencimento
-precisam de `idempotency_key` propagada até a chamada HTTP real (spec §5,
-"Idempotência"). Confirmar se a API Hubsoft aceita header idempotente
-(`Idempotency-Key`) nativamente ou se precisamos implementar de-dupe do
-lado do conector (ex.: Redis `SETNX` com TTL, checando a chave antes de
-disparar a chamada).
+- **`Subscriber.olt_id`/`cto_id`/`cpe_serial`**: não vêm em
+  `GET /cliente`. `pon` vem parcialmente (`servicos[].interface.nome`, ex.
+  `"PON5"`), mas `olt_id`/`cto_id` exigiriam correlacionar com
+  `rede/equipamento.rst`/`rede/pop.rst` — não explorado ainda. Sem isso,
+  **NET-03 (correlação de massivo) não funciona com `HubsoftConnector`** —
+  só com `MockISPConnector` por enquanto, já que `get_area_incidents`
+  também não existe no ERP.
+- **`Subscriber.loyalty_until`** (fidelidade contratual, spec FIN-04): não
+  encontrado em `GET /cliente`. Pode estar em um endpoint de contrato não
+  mapeado ainda.
+- **`get_connection_status`/`create_service_order`/`create_protocol`
+  exigem que `find_subscriber` tenha rodado antes** na mesma instância do
+  conector (populam caches internos de login/contato). Isso é seguro no
+  fluxo real do `CallOrchestrator` (identificação sempre vem primeiro),
+  mas é uma dependência de ordem que uma implementação ingênua poderia
+  violar — documentado nos docstrings dos métodos.
+- **`ordens_servico[]` dentro da resposta de `POST /atendimento`**: a doc
+  pública não mostra um exemplo completo desse array quando `abrir_os=true`
+  — o parsing em `create_service_order` é defensivo (tenta `id_ordem_servico`
+  ou `id`) mas precisa validação contra um ambiente real.
+- **Idempotência (spec §5)**: a Hubsoft não documenta um header tipo
+  `Idempotency-Key`. Chamadas que mutam estado (`POST`) usam
+  `max_retries=0` na camada de resiliência (`resilience.py`) para nunca
+  reenviar automaticamente uma ação que talvez já tenha sido processada.
 
-## Cache (spec §4.4)
+## Quando houver acesso a um ambiente real
 
-TTL curto (30–120s) para dados de sessão/status — aplicar depois que os
-endpoints reais e a volatilidade de cada um forem conhecidos (ex.: dado de
-fatura pode cachear mais tempo que status de sessão RADIUS).
-
-## Quando a documentação chegar
-
-1. Preencher `HUBSOFT_BASE_URL`/`HUBSOFT_CLIENT_ID`/`HUBSOFT_CLIENT_SECRET` no `.env`
-2. Implementar `_authenticate()` e `_request()` em `hubsoft.py` com o fluxo real
-3. Trocar cada `raise NotImplementedError(...)` pela chamada real, mapeando o schema de resposta para os modelos Pydantic de `connectors/models.py`
-4. Rodar `tests/test_mock_connector.py` adaptado (ou uma cópia parametrizada) contra `HubsoftConnector` em ambiente de sandbox — mesma bateria de contrato
-5. Validar os campos de `Subscriber` (`olt_id`/`pon`/`cto_id`/`cpe_serial`) — se a Hubsoft não tiver isso, precisa vir de um adapter de NMS/ACS combinado no orquestrador
+1. Preencher `HUBSOFT_BASE_URL`/`CLIENT_ID`/`CLIENT_SECRET`/`USERNAME`/`PASSWORD` no `.env`
+2. Rodar a mesma bateria de testes de contrato do `MockISPConnector`
+   (`tests/test_mock_connector.py`) contra o `HubsoftConnector` em modo
+   integração (fora do CI, com credenciais reais) para validar os campos
+   que a doc pública não cobre por completo
+3. Resolver `olt_id`/`cto_id`/`cpe_serial` via `rede/equipamento.rst` ou
+   confirmar que vêm de um adapter de ACS separado
+4. Validar o formato exato de `ordens_servico[]` em `POST /atendimento`
+   com `abrir_os=true` contra uma resposta real

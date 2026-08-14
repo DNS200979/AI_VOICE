@@ -17,10 +17,15 @@ class Settings(BaseSettings):
 
     isp_connector: str = "mock"
 
-    # --- Hubsoft (ver docs/connectors/hubsoft.md — aguardando documentação da API) ---
+    # --- Hubsoft (ver docs/connectors/hubsoft.md) ---
+    # OAuth2 "password grant" — a API da Hubsoft exige as 4 credenciais
+    # (client_id/client_secret identificam a integração; username/password
+    # são de um usuário do sistema com permissão de API).
     hubsoft_base_url: str = ""
     hubsoft_client_id: str = ""
     hubsoft_client_secret: str = ""
+    hubsoft_username: str = ""
+    hubsoft_password: str = ""
 
     asr_provider: str = "stub"
     asr_api_key: str = ""

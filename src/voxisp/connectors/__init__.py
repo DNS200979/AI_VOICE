@@ -17,9 +17,11 @@ def get_connector(name: str = "mock", settings=None) -> ISPConnector:
     """Fábrica de conectores. Novas implementações (IXC, SGP, Voalle, MK
     Solutions) se registram aqui conforme forem escritas — ver spec §4.4.
 
-    `HubsoftConnector` está stubado (ver docs/connectors/hubsoft.md):
-    instancia normalmente, mas cada método real levanta
-    `NotImplementedError` até a documentação da API chegar.
+    `HubsoftConnector` fala com a API real da Hubsoft (ver
+    docs/connectors/hubsoft.md) — precisa de `HUBSOFT_BASE_URL/CLIENT_ID/
+    CLIENT_SECRET/USERNAME/PASSWORD` no `.env`. `get_cpe_diagnostics`,
+    `reboot_cpe` e `get_area_incidents` continuam levantando
+    `NotImplementedError`: confirmado que não existem no ERP, só em ACS/NMS.
     """
     if name == "mock":
         return MockISPConnector()
@@ -30,6 +32,6 @@ def get_connector(name: str = "mock", settings=None) -> ISPConnector:
             settings = default_settings
         return HubsoftConnector(settings)
     raise ValueError(
-        f"Conector '{name}' ainda não implementado. Disponíveis: mock, hubsoft (stub). "
+        f"Conector '{name}' ainda não implementado. Disponíveis: mock, hubsoft. "
         "Implemente ISPConnector em voxisp/connectors/<nome>.py e registre em get_connector()."
     )
