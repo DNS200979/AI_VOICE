@@ -8,25 +8,46 @@ regressão do §9 antes de existir um voice runtime real (LiveKit/Pipecat).
 from __future__ import annotations
 
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from voxisp.config import settings
 from voxisp.connectors import get_connector
+from voxisp.db.repository import CallRepository
+from voxisp.db.session import build_session_maker, init_models
 from voxisp.observability.logging import configure_logging, get_logger
 from voxisp.orchestrator import CallOrchestrator, get_llm_client
 
 configure_logging()
 logger = get_logger(__name__)
 
+_SESSIONS: dict[str, CallOrchestrator] = {}
+_repository: CallRepository | None = None
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    global _repository
+    if settings.persistence_enabled:
+        engine, session_maker = build_session_maker(settings.database_url)
+        # Atalho de dev: cria as tabelas se não existirem. Em produção,
+        # aplicar db/schema.sql (ou uma migração real) em vez de depender
+        # disso no boot.
+        await init_models(engine)
+        _repository = CallRepository(session_maker)
+        logger.info("persistence_enabled")
+    yield
+
+
 app = FastAPI(
     title="VOX-ISP",
     description="Atendente virtual de voz para ISPs — API de orquestração (spec-voicebot-isp.md)",
     version="0.1.0",
+    lifespan=lifespan,
 )
-
-_SESSIONS: dict[str, CallOrchestrator] = {}
 
 
 class IdentifyRequest(BaseModel):
@@ -46,7 +67,12 @@ class TurnResponse(BaseModel):
 
 @app.get("/health")
 async def health() -> dict:
-    return {"status": "ok", "isp_connector": settings.isp_connector, "llm_provider": settings.llm_provider}
+    return {
+        "status": "ok",
+        "isp_connector": settings.isp_connector,
+        "llm_provider": settings.llm_provider,
+        "persistence_enabled": settings.persistence_enabled,
+    }
 
 
 @app.post("/calls", response_model=TurnResponse)
@@ -55,6 +81,9 @@ async def start_call() -> TurnResponse:
     orchestrator = CallOrchestrator(
         connector=get_connector(settings.isp_connector),
         llm=get_llm_client(settings.llm_provider, settings),
+        repository=_repository,
+        ani="webapi",
+        dnis="demo",
     )
     _SESSIONS[call_id] = orchestrator
     result = await orchestrator.greet()
@@ -94,3 +123,15 @@ async def utterance(call_id: str, body: UtteranceRequest) -> TurnResponse:
         protocol_number=result.protocol_number,
         escalation_reason=result.escalation.reason if result.escalation else None,
     )
+
+
+@app.post("/calls/{call_id}/end")
+async def end_call(call_id: str) -> dict:
+    """Encerra a chamada sem transbordo (contida) — equivalente ao hangup em
+    telefonia real. Chamadas já escaladas já são finalizadas/removidas em
+    `/utterance`; este endpoint cobre o caso de sucesso (ver `CallOrchestrator.finish`)."""
+    session = _get_session(call_id)
+    await session.finish()
+    _SESSIONS.pop(call_id, None)
+    logger.info("call_ended", call_id=call_id)
+    return {"status": "ended", "call_id": call_id}

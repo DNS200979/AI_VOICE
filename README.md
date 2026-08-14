@@ -45,6 +45,9 @@ src/voxisp/
   voice/          interfaces de ASR/TTS (stubs — plugar Deepgram/ElevenLabs/etc.)
   telephony/      contrato da ponte de áudio (stub — plugar Asterisk/LiveKit/Pipecat)
   db/schema.sql   modelo de dados núcleo (§8): call, turn, action, escalation, incident_link
+  db/models.py    mesmos modelos como ORM SQLAlchemy 2.0 async (Postgres em prod, SQLite em teste)
+  db/repository.py  CallRepository — grava call/turn/action/escalation nos pontos de gravação
+                  do CallOrchestrator (opcional: PERSISTENCE_ENABLED=false por padrão)
   main.py         API HTTP de demonstração (não é o runtime de voz final)
 tests/            FSM, conector mock, detecção de massivo, orquestrador ponta a ponta
 ```
@@ -55,10 +58,14 @@ Requer Python 3.12+.
 
 ```bash
 make install      # cria venv e instala em modo editável + deps de dev
-make test         # roda a suíte de testes (23 testes, sem infra externa)
-make up           # sobe Postgres + Redis via docker compose (opcional nesta fase)
+make test         # roda a suíte de testes (50 testes, sem infra externa — inclui SQLite in-memory)
+make up           # sobe Postgres + Redis via docker compose (só necessário com PERSISTENCE_ENABLED=true)
 make dev          # sobe a API de demonstração em http://localhost:8000
 ```
+
+Por padrão a API roda **100% em memória** (nada é gravado). Para persistir call/turn/action/escalation
+de verdade: `make up` (sobe Postgres) e `PERSISTENCE_ENABLED=true` no `.env` — as tabelas são criadas
+automaticamente no boot (atalho de dev; em produção prefira aplicar `db/schema.sql` ou uma migração real).
 
 Exemplo de chamada simulada via HTTP (reproduz o fluxo do §7.2 da spec):
 
@@ -88,12 +95,17 @@ Implementado (Fase 1 do roadmap da spec, §10):
   estruturada validada por schema, timeout duro de 1,5s com degradação para transbordo). Ativar com
   `LLM_PROVIDER=anthropic` + `LLM_API_KEY` no `.env`; `StubLLMClient` (keyword, sem rede) continua
   como padrão em dev/CI
+- **Persistência real** (SQLAlchemy 2.0 async): `Call`/`Turn`/`Action`/`Escalation`/`IncidentLink`
+  gravados nos pontos de gravação do `CallOrchestrator` — turno a turno, ação com `idempotency_key`
+  (spec §5), escalonamento com payload de contexto (§7.3), fechamento com `duration_s`/`outcome`.
+  Opcional (`PERSISTENCE_ENABLED=false` por padrão); mesmo código roda contra Postgres em produção
+  ou SQLite in-memory nos testes
 
 Pendente — próximas fases:
 1. Preencher o `HubsoftConnector` assim que a documentação/credenciais da API chegarem (ou escrever `IXCSoftConnector`/`VoalleConnector` se o piloto for outro ERP), além dos adapters de telemetria (RADIUS, ACS, OLT/SNMP, Zabbix)
 2. Tool-calling real com allowlist de ferramentas por estado da FSM (hoje o roteamento de intent já passa pela FSM, mas o LLM ainda não chama tools diretamente)
 3. ASR/TTS de produção (Deepgram/Azure + ElevenLabs/Cartesia) e voice runtime (LiveKit Agents ou Pipecat) ligado a Asterisk/Kamailio
-4. Persistência real (SQLAlchemy + Postgres) das tabelas `call`/`turn`/`action`/`escalation`
+4. Migração real (Alembic) em vez do `create_all` de conveniência usado hoje no boot da API
 5. Parecer jurídico formal (Decreto 11.034, RGC, LGPD) antes de qualquer go-live — ver spec §6
 
 Ver `spec-voicebot-isp.md` §10 (roadmap) e §14 (próximos passos) para o plano completo.

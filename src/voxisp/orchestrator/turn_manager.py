@@ -12,11 +12,13 @@ devolve texto para o TTS, sem saber nada de áudio.
 from __future__ import annotations
 
 import re
+import uuid
 from dataclasses import dataclass, field
 from typing import ClassVar
 
 from voxisp.connectors.base import ISPConnector
 from voxisp.connectors.models import ConnectionStatus, Subscriber
+from voxisp.db.repository import CallRepository
 from voxisp.fsm.engine import CallFSM, EscalationRequired
 from voxisp.fsm.states import CallState, Intent
 from voxisp.massive_detection import check_massive_incident
@@ -73,21 +75,28 @@ class CallOrchestrator:
     llm: LLMClient
     fsm: CallFSM = field(default_factory=CallFSM)
     subscriber: Subscriber | None = None
+    # Persistência (spec §8) — opcional. Sem `repository`, o orquestrador se
+    # comporta exatamente como antes (só mantém o transcript em memória).
+    repository: CallRepository | None = None
+    ani: str = "unknown"
+    dnis: str = "unknown"
+    call_id: uuid.UUID | None = None
     _transcript: list[TurnLogEntry] = field(default_factory=list)
     _diagnostics: dict[str, object] = field(default_factory=dict)
     _protocol_number: str | None = None
+    _turn_seq: int = field(default=0, init=False, repr=False)
 
     async def greet(self) -> TurnResult:
         text = (
             "Provedor, assistente virtual. Sua ligação é gravada. "
             "Me diga seu CPF, por favor."
         )
-        self._log("assistant", text)
+        await self._log("assistant", text)
         self.fsm.state = CallState.IDENTIFICATION
         return TurnResult(text=text)
 
     async def identify(self, spoken_cpf: str) -> TurnResult:
-        self._log("customer", spoken_cpf)
+        await self._log("customer", spoken_cpf)
         if not _validate_cpf(spoken_cpf):
             self.fsm.record_recognition_failure("cpf")
             return TurnResult(text="Não consegui validar esse CPF. Pode repetir, por favor?")
@@ -101,11 +110,11 @@ class CallOrchestrator:
         self.fsm.reset_recognition_failures("cpf")
         self.fsm.state = CallState.INTENT_ROUTING
         text = f"Obrigada, {subscriber.name.split()[0]}. Como posso ajudar?"
-        self._log("assistant", text)
+        await self._log("assistant", text)
         return TurnResult(text=text)
 
     async def handle_utterance(self, utterance: str) -> TurnResult:
-        self._log("customer", utterance)
+        await self._log("customer", utterance)
         # Regra inviolável #1 — checada antes de qualquer classificação de intenção.
         if any(kw in utterance.lower() for kw in ("atendente", "pessoa", "humano")):
             return await self._escalate("solicitação explícita de atendente", Intent.ESC_04_HUMAN_REQUEST)
@@ -131,7 +140,7 @@ class CallOrchestrator:
         self._diagnostics["FIN-02.get_invoices"] = [i.model_dump(mode="json") for i in invoices]
         if not invoices:
             text = "Não encontrei faturas em aberto no seu cadastro. Posso ajudar em algo mais?"
-            self._log("assistant", text)
+            await self._log("assistant", text)
             return TurnResult(text=text)
 
         payload = await self.connector.issue_second_copy(invoices[0].id)
@@ -140,7 +149,7 @@ class CallOrchestrator:
             f"Vou te enviar por WhatsApp o PIX copia-e-cola e a linha digitável da fatura "
             f"de R$ {payload.amount_cents / 100:.2f}, vencimento {payload.due_date.strftime('%d/%m')}."
         )
-        self._log("assistant", text)
+        await self._log("assistant", text)
         return TurnResult(text=text)
 
     async def _handle_fin_03(self) -> TurnResult:
@@ -152,7 +161,13 @@ class CallOrchestrator:
         else:
             text = "Vou liberar seu acesso por 48 horas. Confirma o desbloqueio de confiança?"
             self.fsm.request_action(Intent.FIN_03_TRUST_UNLOCK)
-        self._log("assistant", text)
+            await self._log_action(
+                tool_name="request_trust_unlock",
+                params={"subscriber_id": self.subscriber.id},
+                result=result.model_dump(mode="json"),
+                status="success",
+            )
+        await self._log("assistant", text)
         return TurnResult(text=text)
 
     async def _handle_net_01(self) -> TurnResult:
@@ -181,7 +196,11 @@ class CallOrchestrator:
                 f"Seu protocolo é {protocol.protocol_number}."
             )
             self.fsm.complete_execution()
-            self._log("assistant", text)
+            await self._log("assistant", text)
+            if self.repository is not None and self.call_id is not None:
+                await self.repository.link_incident(
+                    call_id=self.call_id, incident_id=massive.incident.id, source="massivo"
+                )
             return TurnResult(text=text, protocol_number=protocol.protocol_number)
 
         # Caso individual — sem massivo, segue diagnóstico ponto a ponto.
@@ -199,7 +218,7 @@ class CallOrchestrator:
                 f"Posso reiniciar seu equipamento remotamente, pode ser? Protocolo {protocol.protocol_number}."
             )
         self.fsm.complete_execution()
-        self._log("assistant", text)
+        await self._log("assistant", text)
         return TurnResult(text=text, protocol_number=protocol.protocol_number)
 
     async def _handle_ops_01(self) -> TurnResult:
@@ -211,7 +230,7 @@ class CallOrchestrator:
         else:
             so = orders[-1]
             text = f"Sua ordem de serviço está com status '{so.status.value}'."
-        self._log("assistant", text)
+        await self._log("assistant", text)
         return TurnResult(text=text)
 
     _HANDLERS: ClassVar[dict] = {
@@ -238,8 +257,77 @@ class CallOrchestrator:
             protocol_number=protocol_number,
         )
         text = f"Vou te transferir para um atendente humano. Protocolo {protocol_number}."
-        self._log("assistant", text)
+        await self._log("assistant", text)
+
+        if self.repository is not None and self.call_id is not None:
+            queue = "humano"
+            await self.repository.add_escalation(
+                call_id=self.call_id,
+                reason=reason,
+                queue=queue,
+                context_payload={
+                    "intent": intent.value,
+                    "transcript_summary": payload.transcript_summary,
+                    "diagnostics_executed": payload.diagnostics_executed,
+                    "protocol_number": protocol_number,
+                },
+            )
+            await self.repository.finish_call(
+                call_id=self.call_id,
+                outcome="escalated",
+                contained=False,
+                subscriber_id=self.subscriber.id if self.subscriber else None,
+                escalated_to=queue,
+                protocol=protocol_number,
+            )
+
         return TurnResult(text=text, escalate=True, escalation=payload, protocol_number=protocol_number)
 
-    def _log(self, role: str, text: str) -> None:
+    async def finish(self, outcome: str = "contained") -> None:
+        """Encerra a chamada sem transbordo (contida) — spec §8, coluna
+        `call.contained`. Chamado explicitamente quando o atendimento se
+        resolve (ex.: cliente confirma que não precisa de mais nada). Em
+        telefonia real isso corresponde ao evento de hangup."""
+        if self.repository is None or self.call_id is None:
+            return
+        await self.repository.finish_call(
+            call_id=self.call_id,
+            outcome=outcome,
+            contained=True,
+            subscriber_id=self.subscriber.id if self.subscriber else None,
+            protocol=self._protocol_number,
+        )
+
+    # -- Persistência (spec §8) — no-op se `repository` não foi injetado ----
+
+    async def _ensure_call_row(self) -> None:
+        if self.repository is not None and self.call_id is None:
+            self.call_id = await self.repository.create_call(ani=self.ani, dnis=self.dnis)
+
+    async def _log(self, role: str, text: str, *, intent: Intent | None = None) -> None:
         self._transcript.append(TurnLogEntry(role=role, text=text))
+        if self.repository is not None:
+            await self._ensure_call_row()
+            assert self.call_id is not None
+            self._turn_seq += 1
+            await self.repository.add_turn(
+                call_id=self.call_id,
+                seq=self._turn_seq,
+                role=role,
+                transcript=text,
+                intent=intent.value if intent is not None else None,
+            )
+
+    async def _log_action(
+        self, *, tool_name: str, params: dict, result: dict, status: str
+    ) -> None:
+        if self.repository is None or self.call_id is None:
+            return
+        await self.repository.add_action(
+            call_id=self.call_id,
+            tool_name=tool_name,
+            params=params,
+            result=result,
+            status=status,
+            idempotency_key=f"{self.call_id}:{tool_name}:{self._turn_seq}",
+        )

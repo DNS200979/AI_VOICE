@@ -11,6 +11,10 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     default_tenant_id: str = "demo"
 
+    # Desligado por padrão: a API de demonstração roda sem nenhuma infra
+    # (nem Postgres) até você optar por persistência real explicitamente.
+    persistence_enabled: bool = False
+
     isp_connector: str = "mock"
 
     # --- Hubsoft (ver docs/connectors/hubsoft.md — aguardando documentação da API) ---
