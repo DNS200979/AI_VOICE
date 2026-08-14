@@ -17,13 +17,27 @@ from dataclasses import dataclass, field
 from typing import ClassVar
 
 from voxisp.connectors.base import ISPConnector
-from voxisp.connectors.models import ConnectionStatus, Subscriber
+from voxisp.connectors.models import (
+    ConnectionStatus,
+    Invoice,
+    PaymentPayload,
+    ServiceOrder,
+    Subscriber,
+    UnlockResult,
+)
 from voxisp.db.repository import CallRepository
 from voxisp.fsm.engine import CallFSM, EscalationRequired
 from voxisp.fsm.states import CallState, Intent
 from voxisp.massive_detection import check_massive_incident
 from voxisp.orchestrator.llm_client import LLMClient
 from voxisp.orchestrator.tool_executor import ToolExecutor
+
+# Regra #7.1 §3 aplicada ao slot de confirmação: interpretação por
+# palavra-chave da resposta do cliente enquanto a FSM está em CONFIRMATION
+# (mesma simplificação de MVP do StubLLMClient — sem chamada de LLM aqui,
+# já que confirmar/negar não é uma classificação de intenção do catálogo).
+_CONFIRM_YES_KEYWORDS = ("sim", "confirmo", "pode", "isso mesmo", "confirmado")
+_CONFIRM_NO_KEYWORDS = ("não", "nao", "cancela", "negativo")
 
 
 def _digits_only(text: str) -> str:
@@ -123,6 +137,11 @@ class CallOrchestrator:
         if any(kw in utterance.lower() for kw in ("atendente", "pessoa", "humano")):
             return await self._escalate("solicitação explícita de atendente", Intent.ESC_04_HUMAN_REQUEST)
 
+        # FSM aguardando confirmação verbal explícita (regra §7.1 #2) — a
+        # fala não é uma nova intenção, é a resposta à pergunta de confirmação.
+        if self.fsm.state == CallState.CONFIRMATION:
+            return await self._handle_confirmation_response(utterance)
+
         classification = await self.llm.classify_intent(utterance, context={"subscriber": self.subscriber})
         try:
             self.fsm.route_intent(classification.intent)
@@ -140,23 +159,85 @@ class CallOrchestrator:
 
     async def _handle_fin_02(self) -> TurnResult:
         assert self.subscriber is not None
-        invoices = await self.connector.get_invoices(self.subscriber.id, status="open")
-        self._diagnostics["FIN-02.get_invoices"] = [i.model_dump(mode="json") for i in invoices]
+        # SLOT_COLLECTION -> EXECUTION: só a partir daqui get_invoices/
+        # issue_second_copy ficam liberadas para o LLM (spec §3.2/§4.3).
+        self.fsm.request_action(Intent.FIN_02_SECOND_COPY)
+
+        if self.tool_executor is not None:
+            invoices, payload = await self._gather_fin02_via_llm()
+        else:
+            invoices = await self.connector.get_invoices(self.subscriber.id, status="open")
+            self._diagnostics["FIN-02.get_invoices"] = [i.model_dump(mode="json") for i in invoices]
+            payload = None
+            if invoices:
+                payload = await self.connector.issue_second_copy(invoices[0].id)
+                self._diagnostics["FIN-02.issue_second_copy"] = payload.model_dump(mode="json")
+
         if not invoices:
             text = "Não encontrei faturas em aberto no seu cadastro. Posso ajudar em algo mais?"
+            self.fsm.complete_execution()
             await self._log("assistant", text)
             return TurnResult(text=text)
 
-        payload = await self.connector.issue_second_copy(invoices[0].id)
-        self._diagnostics["FIN-02.issue_second_copy"] = payload.model_dump(mode="json")
+        # O valor nunca vem do texto livre do modelo (spec §12) — só do
+        # `payload` real devolvido pelo conector, seja via tool-calling ou
+        # chamada direta.
+        assert payload is not None
         text = (
             f"Vou te enviar por WhatsApp o PIX copia-e-cola e a linha digitável da fatura "
             f"de R$ {payload.amount_cents / 100:.2f}, vencimento {payload.due_date.strftime('%d/%m')}."
         )
+        self.fsm.complete_execution()
         await self._log("assistant", text)
         return TurnResult(text=text)
 
+    async def _gather_fin02_via_llm(self) -> tuple[list[Invoice], PaymentPayload | None]:
+        """Deixa o Claude decidir a sequência (consultar faturas e, se
+        houver, emitir a 2ª via) dentro do allowlist de FIN-02. Se o modelo
+        pular um passo obrigatório, o fluxo completa via chamada direta —
+        nunca entrega ao cliente uma resposta sem os dados reais."""
+        assert self.subscriber is not None and self.tool_executor is not None
+        instructions = (
+            f"Assinante {self.subscriber.name} pediu a 2ª via da fatura. Consulte "
+            "as faturas em aberto (status='open'). Se houver alguma, emita a 2ª "
+            "via da primeira fatura retornada. Depois de coletar os dados "
+            "necessários, responda apenas 'ok' — a resposta final ao cliente é "
+            "montada por outro componente a partir dos dados que você coletou."
+        )
+        result = await self.tool_executor.run(
+            subscriber=self.subscriber,
+            intent=Intent.FIN_02_SECOND_COPY,
+            state=self.fsm.state,
+            instructions=instructions,
+        )
+        for tool_name, tool_payload in result.diagnostics.items():
+            self._diagnostics[f"FIN-02.{tool_name}(via-llm)"] = tool_payload
+
+        invoices_payload = result.diagnostics.get("get_invoices")
+        if invoices_payload is not None:
+            invoices = [Invoice.model_validate(i) for i in invoices_payload.get("invoices", [])]
+        else:
+            invoices = await self.connector.get_invoices(self.subscriber.id, status="open")
+            self._diagnostics["FIN-02.get_invoices"] = [i.model_dump(mode="json") for i in invoices]
+
+        if not invoices:
+            return invoices, None
+
+        second_copy_payload = result.diagnostics.get("issue_second_copy")
+        if second_copy_payload is not None:
+            payload = PaymentPayload.model_validate(second_copy_payload)
+        else:
+            payload = await self.connector.issue_second_copy(invoices[0].id)
+            self._diagnostics["FIN-02.issue_second_copy"] = payload.model_dump(mode="json")
+
+        return invoices, payload
+
     async def _handle_fin_03(self) -> TurnResult:
+        """1ª passada (SLOT_COLLECTION): checagem de elegibilidade. Não usa
+        tool-calling — a tool `request_trust_unlock` só entra no allowlist em
+        EXECUTION (spec §3.2), que só é alcançado depois da confirmação
+        verbal explícita tratada em `_handle_confirmation_response`/
+        `_execute_trust_unlock`, regra #2 do §7.1."""
         assert self.subscriber is not None
         result = await self.connector.request_trust_unlock(self.subscriber.id)
         self._diagnostics["FIN-03.request_trust_unlock"] = result.model_dump(mode="json")
@@ -164,13 +245,91 @@ class CallOrchestrator:
             text = f"Não consigo liberar o desbloqueio agora: {result.reason}."
         else:
             text = "Vou liberar seu acesso por 48 horas. Confirma o desbloqueio de confiança?"
-            self.fsm.request_action(Intent.FIN_03_TRUST_UNLOCK)
+            self.fsm.request_action(Intent.FIN_03_TRUST_UNLOCK)  # SLOT_COLLECTION -> CONFIRMATION
             await self._log_action(
                 tool_name="request_trust_unlock",
                 params={"subscriber_id": self.subscriber.id},
                 result=result.model_dump(mode="json"),
                 status="success",
             )
+        await self._log("assistant", text)
+        return TurnResult(text=text)
+
+    async def _handle_confirmation_response(self, utterance: str) -> TurnResult:
+        """Resposta do cliente enquanto a FSM está em CONFIRMATION (regra
+        #2 do §7.1). Ambíguo demais para classificar como sim/não conta
+        como falha de reconhecimento do slot (regra #3)."""
+        lowered = utterance.lower()
+        confirmed = any(kw in lowered for kw in _CONFIRM_YES_KEYWORDS)
+        denied = any(kw in lowered for kw in _CONFIRM_NO_KEYWORDS)
+
+        if confirmed and not denied:
+            self.fsm.confirm_action(confirmed=True)  # CONFIRMATION -> EXECUTION
+            return await self._execute_confirmed_action()
+
+        if denied and not confirmed:
+            self.fsm.confirm_action(confirmed=False)  # CONFIRMATION -> INTENT_ROUTING
+            text = "Sem problemas, não vou realizar essa ação. Posso ajudar em mais alguma coisa?"
+            await self._log("assistant", text)
+            return TurnResult(text=text)
+
+        try:
+            self.fsm.record_recognition_failure("confirmation")
+        except EscalationRequired as exc:
+            return await self._escalate(exc.reason, self.fsm.current_intent or Intent.UNKNOWN)
+        text = "Não entendi. Você confirma a ação? Pode responder sim ou não."
+        await self._log("assistant", text)
+        return TurnResult(text=text)
+
+    async def _execute_confirmed_action(self) -> TurnResult:
+        """A FSM está em EXECUTION — a tool destrutiva do intent atual já
+        está liberada pelo allowlist (spec §4.3), porque só chega aqui
+        depois de `confirm_action(True)`."""
+        assert self.subscriber is not None
+        intent = self.fsm.current_intent
+        if intent == Intent.FIN_03_TRUST_UNLOCK:
+            return await self._execute_trust_unlock()
+        # NET-04/OPS-02/OPS-03 entram em fases futuras (spec §10) — mesmo
+        # padrão de handler quando chegar a vez deles.
+        return await self._escalate(
+            f"confirmação de '{intent}' sem executor implementado nesta fase", intent or Intent.UNKNOWN
+        )
+
+    async def _execute_trust_unlock(self) -> TurnResult:
+        assert self.subscriber is not None
+        if self.tool_executor is not None:
+            result = await self.tool_executor.run(
+                subscriber=self.subscriber,
+                intent=Intent.FIN_03_TRUST_UNLOCK,
+                state=self.fsm.state,
+                instructions=(
+                    f"O assinante {self.subscriber.name} confirmou verbalmente o "
+                    "desbloqueio de confiança. Execute o desbloqueio agora."
+                ),
+            )
+            for tool_name, payload in result.diagnostics.items():
+                self._diagnostics[f"FIN-03.{tool_name}(via-llm)"] = payload
+            unlock_payload = result.diagnostics.get("request_trust_unlock")
+            if unlock_payload is not None:
+                unlock = UnlockResult.model_validate(unlock_payload)
+            else:
+                unlock = await self.connector.request_trust_unlock(self.subscriber.id)
+                self._diagnostics["FIN-03.request_trust_unlock(confirmado)"] = unlock.model_dump(mode="json")
+        else:
+            unlock = await self.connector.request_trust_unlock(self.subscriber.id)
+            self._diagnostics["FIN-03.request_trust_unlock(confirmado)"] = unlock.model_dump(mode="json")
+
+        await self._log_action(
+            tool_name="request_trust_unlock",
+            params={"subscriber_id": self.subscriber.id},
+            result=unlock.model_dump(mode="json"),
+            status="success" if unlock.eligible else "failed",
+        )
+        if unlock.eligible:
+            text = "Pronto! Seu acesso foi liberado por 48 horas. Posso ajudar em mais alguma coisa?"
+        else:
+            text = f"Não consegui concluir o desbloqueio: {unlock.reason}."
+        self.fsm.complete_execution()
         await self._log("assistant", text)
         return TurnResult(text=text)
 
@@ -266,15 +425,49 @@ class CallOrchestrator:
 
     async def _handle_ops_01(self) -> TurnResult:
         assert self.subscriber is not None
-        orders = await self.connector.list_service_orders(self.subscriber.id)
-        self._diagnostics["OPS-01.list_service_orders"] = [o.model_dump(mode="json") for o in orders]
+        # SLOT_COLLECTION -> EXECUTION: só a partir daqui list_service_orders
+        # fica liberada para o LLM (spec §3.2/§4.3).
+        self.fsm.request_action(Intent.OPS_01_SO_STATUS)
+
+        if self.tool_executor is not None:
+            orders = await self._gather_ops01_via_llm()
+        else:
+            orders = await self.connector.list_service_orders(self.subscriber.id)
+            self._diagnostics["OPS-01.list_service_orders"] = [o.model_dump(mode="json") for o in orders]
+
         if not orders:
             text = "Não encontrei ordens de serviço em aberto no seu cadastro."
         else:
             so = orders[-1]
             text = f"Sua ordem de serviço está com status '{so.status.value}'."
+        self.fsm.complete_execution()
         await self._log("assistant", text)
         return TurnResult(text=text)
+
+    async def _gather_ops01_via_llm(self) -> list[ServiceOrder]:
+        assert self.subscriber is not None and self.tool_executor is not None
+        instructions = (
+            f"Assinante {self.subscriber.name} quer saber o status da ordem de "
+            "serviço dele. Consulte as ordens de serviço do assinante. Depois "
+            "de coletar os dados, responda apenas 'ok' — a resposta final ao "
+            "cliente é montada por outro componente."
+        )
+        result = await self.tool_executor.run(
+            subscriber=self.subscriber,
+            intent=Intent.OPS_01_SO_STATUS,
+            state=self.fsm.state,
+            instructions=instructions,
+        )
+        for tool_name, payload in result.diagnostics.items():
+            self._diagnostics[f"OPS-01.{tool_name}(via-llm)"] = payload
+
+        orders_payload = result.diagnostics.get("list_service_orders")
+        if orders_payload is not None:
+            return [ServiceOrder.model_validate(o) for o in orders_payload.get("service_orders", [])]
+
+        orders = await self.connector.list_service_orders(self.subscriber.id)
+        self._diagnostics["OPS-01.list_service_orders"] = [o.model_dump(mode="json") for o in orders]
+        return orders
 
     _HANDLERS: ClassVar[dict] = {
         Intent.FIN_02_SECOND_COPY: _handle_fin_02,

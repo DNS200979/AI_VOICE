@@ -74,3 +74,89 @@ async def test_net01_falls_back_to_direct_call_if_model_skips_the_tool():
 
     assert result.escalate is False
     assert "NET-01.get_connection_status" in orch._diagnostics  # via fallback determinístico
+
+
+async def test_fin02_flow_via_tool_executor():
+    connector = MockISPConnector()
+    responses = [
+        _FakeResponse([_FakeBlock("tool_use", id="c1", name="get_invoices", input={"status": "open"})]),
+        _FakeResponse(
+            [_FakeBlock("tool_use", id="c2", name="issue_second_copy", input={"invoice_id": "inv-1001"})]
+        ),
+        _FakeResponse([_FakeBlock("text", text="ok")]),
+    ]
+    tool_executor = ToolExecutor(client=_FakeAnthropicClient(responses), connector=connector)
+
+    orch = CallOrchestrator(connector=connector, llm=StubLLMClient(), tool_executor=tool_executor)
+    await orch.greet()
+    await orch.identify("111.444.777-35")
+
+    result = await orch.handle_utterance("Preciso da segunda via do boleto")
+
+    assert result.escalate is False
+    assert "R$" in result.text
+    assert "FIN-02.get_invoices(via-llm)" in orch._diagnostics
+    assert "FIN-02.issue_second_copy(via-llm)" in orch._diagnostics
+
+
+async def test_fin02_completes_second_copy_if_model_lists_but_skips_issuing():
+    """O modelo consultou as faturas mas não emitiu a 2ª via — o fluxo
+    completa via chamada direta em vez de responder sem o PIX/linha
+    digitável (spec §12: cliente sempre recebe o que pediu, com dado real)."""
+    connector = MockISPConnector()
+    responses = [
+        _FakeResponse([_FakeBlock("tool_use", id="c1", name="get_invoices", input={"status": "open"})]),
+        _FakeResponse([_FakeBlock("text", text="há uma fatura em aberto")]),
+    ]
+    tool_executor = ToolExecutor(client=_FakeAnthropicClient(responses), connector=connector)
+
+    orch = CallOrchestrator(connector=connector, llm=StubLLMClient(), tool_executor=tool_executor)
+    await orch.greet()
+    await orch.identify("111.444.777-35")
+
+    result = await orch.handle_utterance("Preciso da segunda via do boleto")
+
+    assert result.escalate is False
+    assert "R$" in result.text
+    assert "FIN-02.issue_second_copy" in orch._diagnostics  # sem sufixo "(via-llm)" -> veio do fallback
+
+
+async def test_ops01_flow_via_tool_executor():
+    connector = MockISPConnector()
+    responses = [
+        _FakeResponse([_FakeBlock("tool_use", id="c1", name="list_service_orders", input={})]),
+        _FakeResponse([_FakeBlock("text", text="ok")]),
+    ]
+    tool_executor = ToolExecutor(client=_FakeAnthropicClient(responses), connector=connector)
+
+    orch = CallOrchestrator(connector=connector, llm=StubLLMClient(), tool_executor=tool_executor)
+    await orch.greet()
+    await orch.identify("111.444.777-35")
+
+    result = await orch.handle_utterance("quero saber o status da os")
+
+    assert result.escalate is False
+    assert "OPS-01.list_service_orders(via-llm)" in orch._diagnostics
+
+
+async def test_fin03_confirmed_execution_via_tool_executor():
+    """1ª passada (elegibilidade) é sempre determinística — a tool
+    `request_trust_unlock` só entra no allowlist depois da confirmação
+    verbal, quando a FSM alcança EXECUTION (spec §3.2/§4.3)."""
+    connector = MockISPConnector()
+    responses = [
+        _FakeResponse([_FakeBlock("tool_use", id="c1", name="request_trust_unlock", input={})]),
+        _FakeResponse([_FakeBlock("text", text="ok")]),
+    ]
+    tool_executor = ToolExecutor(client=_FakeAnthropicClient(responses), connector=connector)
+
+    orch = CallOrchestrator(connector=connector, llm=StubLLMClient(), tool_executor=tool_executor)
+    await orch.greet()
+    await orch.identify("111.444.777-35")
+    await orch.handle_utterance("quero o desbloqueio de confiança")
+
+    result = await orch.handle_utterance("sim, confirmo")
+
+    assert result.escalate is False
+    assert "liberado" in result.text.lower()
+    assert "FIN-03.request_trust_unlock(via-llm)" in orch._diagnostics
