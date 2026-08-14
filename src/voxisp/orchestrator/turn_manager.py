@@ -18,10 +18,12 @@ from typing import ClassVar
 
 from voxisp.connectors.base import ISPConnector
 from voxisp.connectors.models import (
+    ActionResult,
     ConnectionStatus,
     Invoice,
     PaymentPayload,
     ServiceOrder,
+    SODraft,
     Subscriber,
     UnlockResult,
 )
@@ -289,8 +291,16 @@ class CallOrchestrator:
         intent = self.fsm.current_intent
         if intent == Intent.FIN_03_TRUST_UNLOCK:
             return await self._execute_trust_unlock()
-        # NET-04/OPS-02/OPS-03 entram em fases futuras (spec §10) — mesmo
-        # padrão de handler quando chegar a vez deles.
+        if intent == Intent.NET_04_REBOOT_CPE:
+            return await self._execute_reboot_cpe()
+        if intent == Intent.OPS_02_SO_SCHEDULE:
+            return await self._execute_service_order(
+                category="visita_tecnica", summary="Agendamento de visita técnica solicitado pelo cliente"
+            )
+        if intent == Intent.OPS_03_SO_CREATE:
+            return await self._execute_service_order(
+                category="suporte_tecnico", summary="Abertura de OS solicitada pelo cliente"
+            )
         return await self._escalate(
             f"confirmação de '{intent}' sem executor implementado nesta fase", intent or Intent.UNKNOWN
         )
@@ -330,6 +340,142 @@ class CallOrchestrator:
         else:
             text = f"Não consegui concluir o desbloqueio: {unlock.reason}."
         self.fsm.complete_execution()
+        await self._log("assistant", text)
+        return TurnResult(text=text)
+
+    async def _execute_reboot_cpe(self) -> TurnResult:
+        assert self.subscriber is not None and self.subscriber.cpe_serial is not None
+        cpe_serial = self.subscriber.cpe_serial
+
+        if self.tool_executor is not None:
+            result = await self.tool_executor.run(
+                subscriber=self.subscriber,
+                intent=Intent.NET_04_REBOOT_CPE,
+                state=self.fsm.state,
+                instructions=(
+                    f"O assinante {self.subscriber.name} confirmou verbalmente o "
+                    "reboot do roteador. Execute o reboot agora."
+                ),
+            )
+            for tool_name, payload in result.diagnostics.items():
+                self._diagnostics[f"NET-04.{tool_name}(via-llm)"] = payload
+            action_payload = result.diagnostics.get("reboot_cpe")
+            if action_payload is not None:
+                action = ActionResult.model_validate(action_payload)
+            else:
+                action = await self._reboot_cpe(cpe_serial)
+                self._diagnostics["NET-04.reboot_cpe(confirmado)"] = action.model_dump(mode="json")
+        else:
+            action = await self._reboot_cpe(cpe_serial)
+            self._diagnostics["NET-04.reboot_cpe(confirmado)"] = action.model_dump(mode="json")
+
+        await self._log_action(
+            tool_name="reboot_cpe",
+            params={"cpe_serial": cpe_serial},
+            result=action.model_dump(mode="json"),
+            status="success" if action.success else "failed",
+        )
+        if action.success:
+            text = (
+                "Pronto, enviei o comando de reinicialização. Aguarde cerca de 1 "
+                "minuto para a internet voltar. Posso ajudar em mais alguma coisa?"
+            )
+        else:
+            text = f"Não consegui reiniciar o equipamento agora: {action.message}"
+        self.fsm.complete_execution()
+        await self._log("assistant", text)
+        return TurnResult(text=text)
+
+    async def _reboot_cpe(self, cpe_serial: str) -> ActionResult:
+        assert self.subscriber is not None
+        idem_key = f"reboot:{self.subscriber.id}:{uuid.uuid4().hex[:8]}"
+        return await self.connector.reboot_cpe(cpe_serial, idempotency_key=idem_key)
+
+    async def _execute_service_order(self, *, category: str, summary: str) -> TurnResult:
+        """Compartilhado por OPS-02 (agendamento de visita) e OPS-03
+        (abertura de OS) — o `ISPConnector` ainda não tem um método
+        dedicado de agendamento/reagendamento/cancelamento (spec §2.1
+        lista OPS-02 como item separado), então OPS-02 usa
+        `create_service_order` com categoria de agendamento como
+        simplificação de MVP. Estender para reagendar/cancelar OS
+        existentes exige um novo método no `ISPConnector` — fica para
+        quando um ERP real (Hubsoft etc.) definir esse contrato."""
+        assert self.subscriber is not None
+        intent = self.fsm.current_intent
+        prefix = "OPS-02" if intent == Intent.OPS_02_SO_SCHEDULE else "OPS-03"
+
+        if self.tool_executor is not None:
+            result = await self.tool_executor.run(
+                subscriber=self.subscriber,
+                intent=intent,
+                state=self.fsm.state,
+                instructions=(
+                    f"O assinante {self.subscriber.name} confirmou verbalmente. Abra "
+                    f"a ordem de serviço agora com category='{category}' e "
+                    f"summary='{summary}'."
+                ),
+            )
+            for tool_name, payload in result.diagnostics.items():
+                self._diagnostics[f"{prefix}.{tool_name}(via-llm)"] = payload
+            so_payload = result.diagnostics.get("create_service_order")
+            if so_payload is not None:
+                service_order = ServiceOrder.model_validate(so_payload)
+            else:
+                service_order = await self._create_service_order(category, summary)
+                self._diagnostics[f"{prefix}.create_service_order(confirmado)"] = service_order.model_dump(
+                    mode="json"
+                )
+        else:
+            service_order = await self._create_service_order(category, summary)
+            self._diagnostics[f"{prefix}.create_service_order(confirmado)"] = service_order.model_dump(mode="json")
+
+        protocol = await self.connector.create_protocol(self.subscriber.id, f"{prefix}: {summary}")
+        self._protocol_number = protocol.protocol_number
+
+        await self._log_action(
+            tool_name="create_service_order",
+            params={"category": category, "summary": summary},
+            result=service_order.model_dump(mode="json"),
+            status="success",
+        )
+        text = (
+            f"Pronto! Abri a ordem de serviço para você. Seu protocolo é "
+            f"{protocol.protocol_number}. Posso ajudar em mais alguma coisa?"
+        )
+        self.fsm.complete_execution()
+        await self._log("assistant", text)
+        return TurnResult(text=text, protocol_number=protocol.protocol_number)
+
+    async def _create_service_order(self, category: str, summary: str) -> ServiceOrder:
+        assert self.subscriber is not None
+        draft = SODraft(subscriber_id=self.subscriber.id, category=category, summary=summary)
+        return await self.connector.create_service_order(draft)
+
+    async def _handle_net_04(self) -> TurnResult:
+        assert self.subscriber is not None
+        if not self.subscriber.cpe_serial:
+            return await self._escalate(
+                "assinante sem CPE cadastrado para reboot remoto", Intent.NET_04_REBOOT_CPE
+            )
+        text = (
+            "Vou reiniciar seu roteador remotamente — a internet fica "
+            "indisponível por cerca de 1 minuto. Confirma?"
+        )
+        self.fsm.request_action(Intent.NET_04_REBOOT_CPE)  # SLOT_COLLECTION -> CONFIRMATION
+        await self._log("assistant", text)
+        return TurnResult(text=text)
+
+    async def _handle_ops_02(self) -> TurnResult:
+        assert self.subscriber is not None
+        text = "Vou agendar uma visita técnica para você. Confirma o agendamento?"
+        self.fsm.request_action(Intent.OPS_02_SO_SCHEDULE)  # SLOT_COLLECTION -> CONFIRMATION
+        await self._log("assistant", text)
+        return TurnResult(text=text)
+
+    async def _handle_ops_03(self) -> TurnResult:
+        assert self.subscriber is not None
+        text = "Vou abrir uma ordem de serviço para o seu caso. Confirma a abertura?"
+        self.fsm.request_action(Intent.OPS_03_SO_CREATE)  # SLOT_COLLECTION -> CONFIRMATION
         await self._log("assistant", text)
         return TurnResult(text=text)
 
@@ -473,7 +619,10 @@ class CallOrchestrator:
         Intent.FIN_02_SECOND_COPY: _handle_fin_02,
         Intent.FIN_03_TRUST_UNLOCK: _handle_fin_03,
         Intent.NET_01_SESSION_DIAGNOSIS: _handle_net_01,
+        Intent.NET_04_REBOOT_CPE: _handle_net_04,
         Intent.OPS_01_SO_STATUS: _handle_ops_01,
+        Intent.OPS_02_SO_SCHEDULE: _handle_ops_02,
+        Intent.OPS_03_SO_CREATE: _handle_ops_03,
     }
 
     # -- Transbordo (spec §7.3) ---------------------------------------------

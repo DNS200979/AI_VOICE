@@ -75,3 +75,97 @@ async def test_human_request_still_wins_during_confirmation():
     result = await orch.handle_utterance("quero falar com atendente")
 
     assert result.escalate is True
+
+
+# -- NET-04 (reboot remoto) ---------------------------------------------
+
+
+async def _start_net04(orch: CallOrchestrator):
+    await orch.greet()
+    await orch.identify("111.444.777-35")  # sub-001: tem cpe_serial cadastrado
+    return await orch.handle_utterance("quero reiniciar o roteador")
+
+
+async def test_net04_asks_confirmation_before_rebooting():
+    orch = _new_orchestrator()
+    result = await _start_net04(orch)
+
+    assert result.escalate is False
+    assert "confirma" in result.text.lower()
+    assert orch.fsm.state == CallState.CONFIRMATION
+
+
+async def test_net04_yes_confirmation_reboots():
+    orch = _new_orchestrator()
+    await _start_net04(orch)
+
+    result = await orch.handle_utterance("sim")
+
+    assert result.escalate is False
+    assert "reinicialização" in result.text.lower()
+    assert orch.fsm.state == CallState.CLOSING
+
+
+async def test_net04_no_confirmation_does_not_reboot():
+    orch = _new_orchestrator()
+    await _start_net04(orch)
+
+    result = await orch.handle_utterance("não")
+
+    assert result.escalate is False
+    assert "não vou realizar" in result.text.lower()
+
+
+async def test_net04_without_cpe_serial_escalates_without_asking_confirmation():
+    """Sem CPE cadastrado não há o que reiniciar — regra geral do
+    orquestrador (quando não consegue completar o pedido, escalona)."""
+    orch = _new_orchestrator()
+    await orch.greet()
+    await orch.identify("111.444.777-35")
+    assert orch.subscriber is not None
+    # model_copy — nunca mutar o objeto do mock in-place: ele é compartilhado
+    # (mesma instância) entre chamadas/testes, e um cpe_serial=None aqui
+    # vazaria para outros testes que também usam este assinante.
+    orch.subscriber = orch.subscriber.model_copy(update={"cpe_serial": None})
+
+    result = await orch.handle_utterance("quero reiniciar o roteador")
+
+    assert result.escalate is True
+    assert orch.fsm.state != CallState.CONFIRMATION
+
+
+# -- OPS-02 (agendamento de visita) --------------------------------------
+
+
+async def test_ops02_confirmation_flow_schedules_visit():
+    orch = _new_orchestrator()
+    await orch.greet()
+    await orch.identify("111.444.777-35")
+    first = await orch.handle_utterance("preciso agendar visita técnica")
+    assert first.escalate is False
+    assert orch.fsm.state == CallState.CONFIRMATION
+
+    result = await orch.handle_utterance("pode sim")
+
+    assert result.escalate is False
+    assert result.protocol_number is not None
+    assert "protocolo" in result.text.lower()
+    assert orch.fsm.state == CallState.CLOSING
+
+
+# -- OPS-03 (abertura de OS) ----------------------------------------------
+
+
+async def test_ops03_confirmation_flow_creates_service_order():
+    orch = _new_orchestrator()
+    await orch.greet()
+    await orch.identify("111.444.777-35")
+    first = await orch.handle_utterance("preciso abrir uma ordem de serviço")
+    assert first.escalate is False
+    assert orch.fsm.state == CallState.CONFIRMATION
+
+    result = await orch.handle_utterance("confirmado")
+
+    assert result.escalate is False
+    assert result.protocol_number is not None
+    assert orch.fsm.state == CallState.CLOSING

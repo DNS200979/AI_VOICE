@@ -55,6 +55,10 @@ class StubLLMClient:
         Intent.NET_01_SESSION_DIAGNOSIS: (
             "sem internet", "caiu", "sem sinal", "sem acesso", "internet parou", "parou de funcionar",
         ),
+        # Antes de OPS_01: evita que a palavra solta "técnico" (abaixo)
+        # capture frases mais específicas de agendamento/abertura de OS.
+        Intent.OPS_02_SO_SCHEDULE: ("agendar visita", "reagendar visita", "marcar visita", "remarcar visita"),
+        Intent.OPS_03_SO_CREATE: ("abrir uma ordem", "abrir uma os", "preciso de um técnico", "mandar um técnico"),
         Intent.OPS_01_SO_STATUS: ("status da ordem", "status da os", "técnico"),
     }
 

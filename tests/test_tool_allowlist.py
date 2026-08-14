@@ -26,6 +26,18 @@ def test_destructive_tool_only_available_in_execution_never_confirmation():
     assert allowed_tools_for_state(CallState.EXECUTION, Intent.FIN_03_TRUST_UNLOCK) == {"request_trust_unlock"}
 
 
+def test_all_destructive_intents_gated_the_same_way():
+    """Mesma regra para os demais intents destrutivos (§7.1 regra #2):
+    NET-04 (reboot), OPS-02 (agendamento) e OPS-03 (abertura de OS)."""
+    for intent, expected in (
+        (Intent.NET_04_REBOOT_CPE, {"reboot_cpe"}),
+        (Intent.OPS_02_SO_SCHEDULE, {"create_service_order"}),
+        (Intent.OPS_03_SO_CREATE, {"create_service_order"}),
+    ):
+        assert allowed_tools_for_state(CallState.CONFIRMATION, intent) == frozenset()
+        assert allowed_tools_for_state(CallState.EXECUTION, intent) == expected
+
+
 def test_no_tools_before_execution():
     for state in (CallState.GREETING, CallState.IDENTIFICATION, CallState.INTENT_ROUTING, CallState.SLOT_COLLECTION):
         assert allowed_tools_for_state(state, Intent.NET_01_SESSION_DIAGNOSIS) == frozenset()

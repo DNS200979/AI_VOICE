@@ -160,3 +160,81 @@ async def test_fin03_confirmed_execution_via_tool_executor():
     assert result.escalate is False
     assert "liberado" in result.text.lower()
     assert "FIN-03.request_trust_unlock(via-llm)" in orch._diagnostics
+
+
+async def test_net04_confirmed_execution_via_tool_executor():
+    connector = MockISPConnector()
+    responses = [
+        _FakeResponse([_FakeBlock("tool_use", id="c1", name="reboot_cpe", input={})]),
+        _FakeResponse([_FakeBlock("text", text="ok")]),
+    ]
+    tool_executor = ToolExecutor(client=_FakeAnthropicClient(responses), connector=connector)
+
+    orch = CallOrchestrator(connector=connector, llm=StubLLMClient(), tool_executor=tool_executor)
+    await orch.greet()
+    await orch.identify("111.444.777-35")
+    await orch.handle_utterance("quero reiniciar o roteador")
+
+    result = await orch.handle_utterance("sim")
+
+    assert result.escalate is False
+    assert "reinicialização" in result.text.lower()
+    assert "NET-04.reboot_cpe(via-llm)" in orch._diagnostics
+
+
+async def test_ops02_confirmed_execution_via_tool_executor():
+    connector = MockISPConnector()
+    responses = [
+        _FakeResponse(
+            [
+                _FakeBlock(
+                    "tool_use",
+                    id="c1",
+                    name="create_service_order",
+                    input={"category": "visita_tecnica", "summary": "Agendamento solicitado pelo cliente"},
+                )
+            ]
+        ),
+        _FakeResponse([_FakeBlock("text", text="ok")]),
+    ]
+    tool_executor = ToolExecutor(client=_FakeAnthropicClient(responses), connector=connector)
+
+    orch = CallOrchestrator(connector=connector, llm=StubLLMClient(), tool_executor=tool_executor)
+    await orch.greet()
+    await orch.identify("111.444.777-35")
+    await orch.handle_utterance("preciso agendar visita técnica")
+
+    result = await orch.handle_utterance("pode sim")
+
+    assert result.escalate is False
+    assert result.protocol_number is not None
+    assert "OPS-02.create_service_order(via-llm)" in orch._diagnostics
+
+
+async def test_ops03_confirmed_execution_via_tool_executor():
+    connector = MockISPConnector()
+    responses = [
+        _FakeResponse(
+            [
+                _FakeBlock(
+                    "tool_use",
+                    id="c1",
+                    name="create_service_order",
+                    input={"category": "suporte_tecnico", "summary": "Abertura de OS solicitada"},
+                )
+            ]
+        ),
+        _FakeResponse([_FakeBlock("text", text="ok")]),
+    ]
+    tool_executor = ToolExecutor(client=_FakeAnthropicClient(responses), connector=connector)
+
+    orch = CallOrchestrator(connector=connector, llm=StubLLMClient(), tool_executor=tool_executor)
+    await orch.greet()
+    await orch.identify("111.444.777-35")
+    await orch.handle_utterance("preciso abrir uma ordem de serviço")
+
+    result = await orch.handle_utterance("confirmado")
+
+    assert result.escalate is False
+    assert result.protocol_number is not None
+    assert "OPS-03.create_service_order(via-llm)" in orch._diagnostics

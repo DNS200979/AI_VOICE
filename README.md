@@ -60,7 +60,7 @@ Requer Python 3.12+.
 
 ```bash
 make install      # cria venv e instala em modo editável + deps de dev
-make test         # roda a suíte de testes (73 testes, sem infra externa — inclui SQLite in-memory)
+make test         # roda a suíte de testes (83 testes, sem infra externa — inclui SQLite in-memory)
 make up           # sobe Postgres + Redis via docker compose (só necessário com PERSISTENCE_ENABLED=true)
 make dev          # sobe a API de demonstração em http://localhost:8000
 ```
@@ -87,7 +87,7 @@ Implementado (Fase 1 do roadmap da spec, §10):
 - FSM com as 6 regras invioláveis do §7.1 (transbordo em 1 palavra, confirmação de ação destrutiva, limites de falha de reconhecimento e de turnos sem progresso)
 - `ISPConnector` (interface) + `MockISPConnector` (dados de demonstração, inclui cenário de massivo)
 - Identificação por CPF com validação de dígito verificador
-- Intents FIN-02, FIN-03, NET-01→03 (fluxo completo do exemplo §7.2), OPS-01
+- Intents FIN-02, FIN-03, NET-01→04, OPS-01→03 (fluxo completo do exemplo NET-01 em §7.2)
 - Payload de transbordo contextualizado (§7.3)
 - Modelo de dados (§8) como SQL pronto para Postgres
 - Camada de resiliência (`resilience.py`): timeout, retry com backoff, circuit breaker (§4.4)
@@ -102,23 +102,26 @@ Implementado (Fase 1 do roadmap da spec, §10):
   (spec §5), escalonamento com payload de contexto (§7.3), fechamento com `duration_s`/`outcome`.
   Opcional (`PERSISTENCE_ENABLED=false` por padrão); mesmo código roda contra Postgres em produção
   ou SQLite in-memory nos testes
-- **Tool-calling real com allowlist por estado** (§3.2/§4.3), em **NET-01, FIN-02, FIN-03 e
-  OPS-01**: `ToolExecutor` roda um loop de tool-use de verdade contra o Claude, mas só declara as
-  tools que `tool_allowlist.py` autoriza para o estado atual da FSM — nunca em
-  SLOT_COLLECTION/CONFIRMATION, só em EXECUTION. Duas camadas de defesa: só a allowlist é
-  declarada na request, e qualquer `tool_use` fora dela é recusado sem executar o conector.
-  Fallback determinístico sempre que o modelo pula uma tool obrigatória. Opcional
-  (`LLM_PROVIDER=anthropic`)
-- **Fluxo de confirmação de ação destrutiva de verdade** (§7.1 regra #2), para FIN-03: 1ª passada
-  checa elegibilidade e pede confirmação (`SLOT_COLLECTION → CONFIRMATION`); a resposta do
-  cliente é interpretada como sim/não *antes* de qualquer classificação de intenção; "sim" chama
-  `confirm_action(True)` (`→ EXECUTION`, só aí a tool destrutiva entra no allowlist) e executa de
-  verdade; "não" cancela sem executar nada; resposta ambígua conta como falha de reconhecimento do
-  slot (regra §7.1 #3) e escalona na 2ª tentativa
+- **Tool-calling real com allowlist por estado** (§3.2/§4.3), em **todos os 7 intents
+  implementados** (NET-01, NET-04, FIN-02, FIN-03, OPS-01, OPS-02, OPS-03): `ToolExecutor` roda um
+  loop de tool-use de verdade contra o Claude, mas só declara as tools que `tool_allowlist.py`
+  autoriza para o estado atual da FSM — nunca em SLOT_COLLECTION/CONFIRMATION, só em EXECUTION.
+  Duas camadas de defesa: só a allowlist é declarada na request, e qualquer `tool_use` fora dela é
+  recusado sem executar o conector. Fallback determinístico sempre que o modelo pula uma tool
+  obrigatória. Opcional (`LLM_PROVIDER=anthropic`)
+- **Fluxo de confirmação de ação destrutiva de verdade** (§7.1 regra #2), para os **4 intents
+  destrutivos do catálogo** (FIN-03, NET-04, OPS-02, OPS-03): 1ª passada pede confirmação
+  (`SLOT_COLLECTION → CONFIRMATION`); a resposta do cliente é interpretada como sim/não *antes* de
+  qualquer classificação de intenção; "sim" chama `confirm_action(True)` (`→ EXECUTION`, só aí a
+  tool destrutiva entra no allowlist) e executa de verdade; "não" cancela sem executar nada;
+  resposta ambígua conta como falha de reconhecimento do slot (regra §7.1 #3) e escalona na 2ª
+  tentativa. OPS-02 reaproveita `create_service_order` (o `ISPConnector` ainda não tem um método
+  dedicado de agendar/reagendar/cancelar visita — fica para quando um ERP real definir esse
+  contrato)
 
 Pendente — próximas fases:
 1. Preencher o `HubsoftConnector` assim que a documentação/credenciais da API chegarem (ou escrever `IXCSoftConnector`/`VoalleConnector` se o piloto for outro ERP), além dos adapters de telemetria (RADIUS, ACS, OLT/SNMP, Zabbix)
-2. Estender o mesmo padrão de confirmação (`_handle_confirmation_response`/`_execute_confirmed_action`) para NET-04, OPS-02 e OPS-03, os demais intents destrutivos do catálogo
+2. Adicionar ao `ISPConnector` um método dedicado de agendar/reagendar/cancelar visita técnica, para OPS-02 parar de reaproveitar `create_service_order`
 3. ASR/TTS de produção (Deepgram/Azure + ElevenLabs/Cartesia) e voice runtime (LiveKit Agents ou Pipecat) ligado a Asterisk/Kamailio
 4. Migração real (Alembic) em vez do `create_all` de conveniência usado hoje no boot da API
 5. Parecer jurídico formal (Decreto 11.034, RGC, LGPD) antes de qualquer go-live — ver spec §6
