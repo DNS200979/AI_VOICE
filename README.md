@@ -36,7 +36,9 @@ A árvore completa de arquitetura (borda telefônica, voice runtime, orçamento 
 ```
 src/voxisp/
   fsm/            máquina de estados + catálogo de intents + regras invioláveis (§7.1)
-  connectors/     ISPConnector (Protocol), modelos Pydantic, MockISPConnector
+  connectors/     ISPConnector (Protocol), modelos Pydantic, MockISPConnector,
+                  HubsoftConnector (stub — ver docs/connectors/hubsoft.md),
+                  resilience.py (timeout + retry + circuit breaker, §4.4)
   orchestrator/   CallOrchestrator (FSM + LLM + Connector Hub) e cliente LLM plugável
   massive_detection.py   algoritmo de correlação de massivo (§4.5)
   voice/          interfaces de ASR/TTS (stubs — plugar Deepgram/ElevenLabs/etc.)
@@ -78,9 +80,12 @@ Implementado (Fase 1 do roadmap da spec, §10):
 - Intents FIN-02, FIN-03, NET-01→03 (fluxo completo do exemplo §7.2), OPS-01
 - Payload de transbordo contextualizado (§7.3)
 - Modelo de dados (§8) como SQL pronto para Postgres
+- Camada de resiliência (`resilience.py`): timeout, retry com backoff, circuit breaker (§4.4)
+- `HubsoftConnector` **stubado**, plugado na fábrica (`ISP_CONNECTOR=hubsoft`), esperando a
+  documentação da API — checklist completo em [`docs/connectors/hubsoft.md`](./docs/connectors/hubsoft.md)
 
 Pendente — próximas fases:
-1. Conectores reais de ERP (`HubsoftConnector`, `IXCSoftConnector`, ...) e de telemetria (RADIUS, ACS, OLT/SNMP, Zabbix)
+1. Preencher o `HubsoftConnector` assim que a documentação/credenciais da API chegarem (ou escrever `IXCSoftConnector`/`VoalleConnector` se o piloto for outro ERP), além dos adapters de telemetria (RADIUS, ACS, OLT/SNMP, Zabbix)
 2. LLM real com prompt caching (substituir `StubLLMClient`) e tool-calling com allowlist por estado
 3. ASR/TTS de produção (Deepgram/Azure + ElevenLabs/Cartesia) e voice runtime (LiveKit Agents ou Pipecat) ligado a Asterisk/Kamailio
 4. Persistência real (SQLAlchemy + Postgres) das tabelas `call`/`turn`/`action`/`escalation`

@@ -13,6 +13,11 @@ class Settings(BaseSettings):
 
     isp_connector: str = "mock"
 
+    # --- Hubsoft (ver docs/connectors/hubsoft.md — aguardando documentação da API) ---
+    hubsoft_base_url: str = ""
+    hubsoft_client_id: str = ""
+    hubsoft_client_secret: str = ""
+
     asr_provider: str = "stub"
     asr_api_key: str = ""
 
