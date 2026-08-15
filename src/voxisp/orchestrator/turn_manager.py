@@ -16,16 +16,19 @@ import uuid
 from dataclasses import dataclass, field
 from typing import ClassVar
 
-from voxisp.connectors.base import ISPConnector
+from voxisp.connectors.base import ConnectorError, ISPConnector
 from voxisp.connectors.models import (
     ActionResult,
     ConnectionStatus,
     Invoice,
     PaymentPayload,
     ServiceOrder,
+    ServiceOrderStatus,
     SODraft,
     Subscriber,
     UnlockResult,
+    VisitAction,
+    VisitDraft,
 )
 from voxisp.db.repository import CallRepository
 from voxisp.fsm.engine import CallFSM, EscalationRequired
@@ -40,6 +43,16 @@ from voxisp.orchestrator.tool_executor import ToolExecutor
 # já que confirmar/negar não é uma classificação de intenção do catálogo).
 _CONFIRM_YES_KEYWORDS = ("sim", "confirmo", "pode", "isso mesmo", "confirmado")
 _CONFIRM_NO_KEYWORDS = ("não", "nao", "cancela", "negativo")
+
+# OPS-02 (spec §2.1) é um único intent cobrindo agendar/reagendar/cancelar
+# visita — a distinção é feita aqui por palavra-chave (mesma simplificação
+# de MVP de _CONFIRM_YES_KEYWORDS acima). Cancelamento checado antes de
+# reagendamento para não confundir "cancelar o reagendamento" com um pedido
+# de reagendar.
+_CANCEL_VISIT_KEYWORDS = ("cancelar a visita", "cancelar o agendamento", "desmarcar", "não quero mais a visita")
+_RESCHEDULE_VISIT_KEYWORDS = (
+    "remarcar", "reagendar", "outro dia", "outro horário", "outra data", "mudar a data", "trocar o horário",
+)
 
 
 def _digits_only(text: str) -> str:
@@ -104,6 +117,12 @@ class CallOrchestrator:
     _transcript: list[TurnLogEntry] = field(default_factory=list)
     _diagnostics: dict[str, object] = field(default_factory=dict)
     _protocol_number: str | None = None
+    # Scratch state de OPS-02 (spec §2.1): decidido em SLOT_COLLECTION
+    # (`_handle_ops_02`), consumido em EXECUTION (`_execute_visit_action`)
+    # depois da confirmação verbal — os dois passam por turnos separados.
+    _visit_action: VisitAction | None = None
+    _visit_service_order_id: str | None = None
+    _visit_context_utterance: str = ""
     _turn_seq: int = field(default=0, init=False, repr=False)
 
     async def greet(self) -> TurnResult:
@@ -294,9 +313,7 @@ class CallOrchestrator:
         if intent == Intent.NET_04_REBOOT_CPE:
             return await self._execute_reboot_cpe()
         if intent == Intent.OPS_02_SO_SCHEDULE:
-            return await self._execute_service_order(
-                category="visita_tecnica", summary="Agendamento de visita técnica solicitado pelo cliente"
-            )
+            return await self._execute_visit_action()
         if intent == Intent.OPS_03_SO_CREATE:
             return await self._execute_service_order(
                 category="suporte_tecnico", summary="Abertura de OS solicitada pelo cliente"
@@ -392,17 +409,11 @@ class CallOrchestrator:
         return await self.connector.reboot_cpe(cpe_serial, idempotency_key=idem_key)
 
     async def _execute_service_order(self, *, category: str, summary: str) -> TurnResult:
-        """Compartilhado por OPS-02 (agendamento de visita) e OPS-03
-        (abertura de OS) — o `ISPConnector` ainda não tem um método
-        dedicado de agendamento/reagendamento/cancelamento (spec §2.1
-        lista OPS-02 como item separado), então OPS-02 usa
-        `create_service_order` com categoria de agendamento como
-        simplificação de MVP. Estender para reagendar/cancelar OS
-        existentes exige um novo método no `ISPConnector` — fica para
-        quando um ERP real (Hubsoft etc.) definir esse contrato."""
+        """OPS-03 (abertura de OS). OPS-02 (agendar/reagendar/cancelar
+        visita) usa `_execute_visit_action`/`manage_visit` — método
+        dedicado do `ISPConnector`, não reaproveita mais este aqui."""
         assert self.subscriber is not None
-        intent = self.fsm.current_intent
-        prefix = "OPS-02" if intent == Intent.OPS_02_SO_SCHEDULE else "OPS-03"
+        intent = Intent.OPS_03_SO_CREATE
 
         if self.tool_executor is not None:
             result = await self.tool_executor.run(
@@ -416,20 +427,20 @@ class CallOrchestrator:
                 ),
             )
             for tool_name, payload in result.diagnostics.items():
-                self._diagnostics[f"{prefix}.{tool_name}(via-llm)"] = payload
+                self._diagnostics[f"OPS-03.{tool_name}(via-llm)"] = payload
             so_payload = result.diagnostics.get("create_service_order")
             if so_payload is not None:
                 service_order = ServiceOrder.model_validate(so_payload)
             else:
                 service_order = await self._create_service_order(category, summary)
-                self._diagnostics[f"{prefix}.create_service_order(confirmado)"] = service_order.model_dump(
+                self._diagnostics["OPS-03.create_service_order(confirmado)"] = service_order.model_dump(
                     mode="json"
                 )
         else:
             service_order = await self._create_service_order(category, summary)
-            self._diagnostics[f"{prefix}.create_service_order(confirmado)"] = service_order.model_dump(mode="json")
+            self._diagnostics["OPS-03.create_service_order(confirmado)"] = service_order.model_dump(mode="json")
 
-        protocol = await self.connector.create_protocol(self.subscriber.id, f"{prefix}: {summary}")
+        protocol = await self.connector.create_protocol(self.subscriber.id, f"OPS-03: {summary}")
         self._protocol_number = protocol.protocol_number
 
         await self._log_action(
@@ -451,6 +462,80 @@ class CallOrchestrator:
         draft = SODraft(subscriber_id=self.subscriber.id, category=category, summary=summary)
         return await self.connector.create_service_order(draft)
 
+    async def _execute_visit_action(self) -> TurnResult:
+        """OPS-02 (spec §2.1: agendar/reagendar/cancelar visita técnica),
+        via `ISPConnector.manage_visit` — método dedicado, real contra a
+        Hubsoft (`ordem_servico/agendar`/`reagendar`/`remove_agendamento`,
+        ver docs/connectors/hubsoft.md). Ação e OS-alvo já foram decididas
+        em `_handle_ops_02`, antes da confirmação; aqui só falta window/reason
+        para reagendamento/cancelamento, que o tool-calling extrai da fala
+        do cliente quando disponível."""
+        assert self.subscriber is not None
+        assert self._visit_action is not None and self._visit_service_order_id is not None
+        action = self._visit_action
+        service_order_id = self._visit_service_order_id
+
+        try:
+            if self.tool_executor is not None:
+                result = await self.tool_executor.run(
+                    subscriber=self.subscriber,
+                    intent=Intent.OPS_02_SO_SCHEDULE,
+                    state=self.fsm.state,
+                    instructions=(
+                        f"O assinante {self.subscriber.name} confirmou verbalmente a ação de "
+                        f"visita técnica '{action.value}'. A fala que motivou essa ação foi: "
+                        f'"{self._visit_context_utterance}". Execute manage_visit agora — se '
+                        "for reagendamento, extraia window_start/window_end (ISO 8601) dessa "
+                        "fala; se for cancelamento, extraia reason; se for agendamento simples, "
+                        "chame sem argumentos."
+                    ),
+                    extra_context={
+                        "visit_action": action.value,
+                        "visit_service_order_id": service_order_id,
+                    },
+                )
+                for tool_name, payload in result.diagnostics.items():
+                    self._diagnostics[f"OPS-02.{tool_name}(via-llm)"] = payload
+                so_payload = result.diagnostics.get("manage_visit")
+                if so_payload is not None:
+                    service_order = ServiceOrder.model_validate(so_payload)
+                else:
+                    service_order = await self._manage_visit(action, service_order_id)
+                    self._diagnostics["OPS-02.manage_visit(confirmado)"] = service_order.model_dump(mode="json")
+            else:
+                service_order = await self._manage_visit(action, service_order_id)
+                self._diagnostics["OPS-02.manage_visit(confirmado)"] = service_order.model_dump(mode="json")
+        except ConnectorError as exc:
+            return await self._escalate(
+                f"falha ao executar {action.value} de visita técnica: {exc}", Intent.OPS_02_SO_SCHEDULE
+            )
+
+        protocol = await self.connector.create_protocol(
+            self.subscriber.id, f"OPS-02 ({action.value}): OS {service_order_id}"
+        )
+        self._protocol_number = protocol.protocol_number
+
+        await self._log_action(
+            tool_name="manage_visit",
+            params={"action": action.value, "service_order_id": service_order_id},
+            result=service_order.model_dump(mode="json"),
+            status="success",
+        )
+        confirmations = {
+            VisitAction.SCHEDULE: "Pronto! Sua visita técnica foi agendada.",
+            VisitAction.RESCHEDULE: "Pronto! Sua visita técnica foi remarcada.",
+            VisitAction.CANCEL: "Pronto, cancelei o agendamento da sua visita técnica.",
+        }
+        text = f"{confirmations[action]} Seu protocolo é {protocol.protocol_number}. Posso ajudar em mais alguma coisa?"
+        self.fsm.complete_execution()
+        await self._log("assistant", text)
+        return TurnResult(text=text, protocol_number=protocol.protocol_number)
+
+    async def _manage_visit(self, action: VisitAction, service_order_id: str) -> ServiceOrder:
+        assert self.subscriber is not None
+        draft = VisitDraft(subscriber_id=self.subscriber.id, action=action, service_order_id=service_order_id)
+        return await self.connector.manage_visit(draft)
+
     async def _handle_net_04(self) -> TurnResult:
         assert self.subscriber is not None
         if not self.subscriber.cpe_serial:
@@ -466,8 +551,63 @@ class CallOrchestrator:
         return TurnResult(text=text)
 
     async def _handle_ops_02(self) -> TurnResult:
+        """OPS-02 (spec §2.1): agendar, reagendar ou cancelar visita
+        técnica — as três ações do único intent do catálogo, distinguidas
+        aqui por palavra-chave na fala que disparou o intent (mesma
+        simplificação de MVP usada em `_CONFIRM_YES_KEYWORDS`). A ação e a
+        OS-alvo ficam decididas antes da confirmação verbal (regra §7.1 #2);
+        `_execute_visit_action` só executa o que já foi decidido aqui."""
         assert self.subscriber is not None
-        text = "Vou agendar uma visita técnica para você. Confirma o agendamento?"
+        utterance = self._transcript[-1].text if self._transcript else ""
+        lowered = utterance.lower()
+        if any(kw in lowered for kw in _CANCEL_VISIT_KEYWORDS):
+            action = VisitAction.CANCEL
+        elif any(kw in lowered for kw in _RESCHEDULE_VISIT_KEYWORDS):
+            action = VisitAction.RESCHEDULE
+        else:
+            action = VisitAction.SCHEDULE
+
+        # Reagendamento depende de extrair a nova data/hora da fala do
+        # cliente — sem tool-calling (LLM real) não há como fazer isso de
+        # forma confiável nesta v1, então escalona em vez de arriscar
+        # reagendar com uma janela errada ou inventada (spec §12).
+        if action == VisitAction.RESCHEDULE and self.tool_executor is None:
+            return await self._escalate(
+                "reagendamento de visita requer extração de data/hora via LLM "
+                "(tool_executor não configurado nesta chamada)",
+                Intent.OPS_02_SO_SCHEDULE,
+            )
+
+        orders = await self.connector.list_service_orders(self.subscriber.id)
+        open_order = next((o for o in reversed(orders) if o.status != ServiceOrderStatus.CANCELLED), None)
+
+        if action in (VisitAction.RESCHEDULE, VisitAction.CANCEL) and open_order is None:
+            return await self._escalate(
+                f"cliente pediu {action.value} de visita, mas não há ordem de serviço localizada",
+                Intent.OPS_02_SO_SCHEDULE,
+            )
+
+        if open_order is None:
+            # `manage_visit` nunca cria uma OS do zero — confirmado que
+            # `ordem_servico/agendar` da Hubsoft exige uma OS já existente
+            # (ver docs/connectors/hubsoft.md). Abre uma antes de agendar.
+            open_order = await self._create_service_order(
+                "visita_tecnica", "Agendamento de visita técnica solicitado pelo cliente"
+            )
+            self._diagnostics["OPS-02.create_service_order(pré-agendamento)"] = open_order.model_dump(
+                mode="json"
+            )
+
+        self._visit_action = action
+        self._visit_service_order_id = open_order.id
+        self._visit_context_utterance = utterance
+
+        prompts = {
+            VisitAction.SCHEDULE: "Vou agendar uma visita técnica para você. Confirma o agendamento?",
+            VisitAction.RESCHEDULE: "Vou remarcar sua visita técnica para o novo horário que você mencionou. Confirma?",
+            VisitAction.CANCEL: "Vou cancelar o agendamento da sua visita técnica. Confirma o cancelamento?",
+        }
+        text = prompts[action]
         self.fsm.request_action(Intent.OPS_02_SO_SCHEDULE)  # SLOT_COLLECTION -> CONFIRMATION
         await self._log("assistant", text)
         return TurnResult(text=text)

@@ -119,6 +119,35 @@ class SODraft(BaseModel):
     preferred_window: str | None = None
 
 
+class VisitAction(StrEnum):
+    """As três ações que o spec §2.1 agrupa sob OPS-02 ("agendamento /
+    reagendamento / cancelamento de visita técnica")."""
+
+    SCHEDULE = "schedule"
+    RESCHEDULE = "reschedule"
+    CANCEL = "cancel"
+
+
+class VisitDraft(BaseModel):
+    """Payload de `ISPConnector.manage_visit` — método dedicado que
+    substitui o reaproveitamento de `create_service_order` para OPS-02.
+
+    `service_order_id` é obrigatório para as três ações: nenhuma delas cria
+    uma OS do zero (isso continua sendo `create_service_order`/OPS-03) —
+    confirmado contra a API real da Hubsoft, `ordem_servico/agendar`
+    exige uma OS já existente (ver docs/connectors/hubsoft.md).
+    `window_start`/`window_end` só se aplicam a `RESCHEDULE`; `reason` só
+    a `CANCEL`.
+    """
+
+    subscriber_id: str
+    action: VisitAction
+    service_order_id: str
+    window_start: datetime | None = None
+    window_end: datetime | None = None
+    reason: str | None = None
+
+
 class Incident(BaseModel):
     id: str
     olt_id: str

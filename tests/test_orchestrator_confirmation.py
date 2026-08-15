@@ -4,6 +4,7 @@ sem `tool_executor` (chamada direta ao conector); o caminho com
 tool-calling real está em `test_orchestrator_tool_calling.py`.
 """
 from voxisp.connectors.mock import MockISPConnector
+from voxisp.connectors.models import SODraft
 from voxisp.fsm.states import CallState
 from voxisp.orchestrator.llm_client import StubLLMClient
 from voxisp.orchestrator.turn_manager import CallOrchestrator
@@ -151,6 +152,53 @@ async def test_ops02_confirmation_flow_schedules_visit():
     assert result.protocol_number is not None
     assert "protocolo" in result.text.lower()
     assert orch.fsm.state == CallState.CLOSING
+
+
+async def test_ops02_cancel_confirmation_flow():
+    """Cancelamento (spec §2.1) reutiliza a OS já aberta em vez de criar
+    uma nova — `manage_visit(action=cancel)` exige `service_order_id`."""
+    connector = MockISPConnector()
+    orch = CallOrchestrator(connector=connector, llm=StubLLMClient())
+    await orch.greet()
+    await orch.identify("111.444.777-35")
+    await connector.create_service_order(
+        SODraft(subscriber_id="sub-001", category="visita_tecnica", summary="Visita já agendada")
+    )
+
+    first = await orch.handle_utterance("quero desmarcar a visita técnica")
+    assert first.escalate is False
+    assert orch.fsm.state == CallState.CONFIRMATION
+
+    result = await orch.handle_utterance("sim")
+
+    assert result.escalate is False
+    assert result.protocol_number is not None
+    assert orch.fsm.state == CallState.CLOSING
+
+
+async def test_ops02_cancel_without_existing_order_escalates():
+    orch = _new_orchestrator()
+    await orch.greet()
+    await orch.identify("111.444.777-35")
+
+    result = await orch.handle_utterance("quero desmarcar a visita técnica")
+
+    assert result.escalate is True
+    assert orch.fsm.state != CallState.CONFIRMATION
+
+
+async def test_ops02_reschedule_without_tool_executor_escalates():
+    """Reagendar exige extrair a nova data/hora da fala do cliente — sem
+    `tool_executor` (LLM real) não há como fazer isso de forma confiável
+    nesta v1, então escalona em vez de arriscar uma janela errada."""
+    orch = _new_orchestrator()
+    await orch.greet()
+    await orch.identify("111.444.777-35")
+
+    result = await orch.handle_utterance("quero reagendar visita")
+
+    assert result.escalate is True
+    assert orch.fsm.state != CallState.CONFIRMATION
 
 
 # -- OPS-03 (abertura de OS) ----------------------------------------------

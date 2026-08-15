@@ -20,6 +20,7 @@ from voxisp.connectors.models import (
     SODraft,
     Subscriber,
     UnlockResult,
+    VisitDraft,
 )
 from voxisp.connectors.models import (
     Protocol as ProtocolRecord,
@@ -49,6 +50,8 @@ class ISPConnector(Protocol):
     async def list_service_orders(self, subscriber_id: str) -> list[ServiceOrder]: ...
 
     async def create_service_order(self, payload: SODraft) -> ServiceOrder: ...
+
+    async def manage_visit(self, draft: VisitDraft) -> ServiceOrder: ...
 
     async def get_area_incidents(self, olt_id: str, pon: str) -> list[Incident]: ...
 

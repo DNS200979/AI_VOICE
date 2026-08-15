@@ -34,6 +34,7 @@ reautentica sozinho quando o token expira ou quando o servidor devolve 401.
 | `reboot_cpe` | **não existe na Hubsoft** | Idem — TR-069 via ACS |
 | `list_service_orders` | `GET /api/v1/integracao/cliente/ordem_servico` (`busca=id_cliente_servico`) | Status da Hubsoft é texto livre em português (`"aguardando_agendamento"`, `"finalizado"` etc.) — mapeado para `ServiceOrderStatus` via tabela; valores não mapeados caem em `OPEN` |
 | `create_service_order` | `POST /api/v1/integracao/atendimento` (`abrir_os=true`) | **Não há endpoint de "criar OS" isolado** — `ordem_servico/agendar` só *agenda* uma OS que já existe. A criação de fato acontece pelo endpoint de atendimento |
+| `manage_visit` (OPS-02: agendar/reagendar/cancelar visita) | `POST /ordem_servico/agendar` \| `/reagendar` \| `/remove_agendamento` | Método dedicado — não reaproveita mais `create_service_order`. Ver seção própria abaixo |
 | `get_area_incidents` | **não existe na Hubsoft** | Confirmado — vem do NMS (Zabbix/OLT SNMP), correlação feita em `massive_detection.py` |
 | `create_protocol` | `POST /api/v1/integracao/atendimento` (sem `abrir_os`) | Mesmo endpoint de `create_service_order`, variando o payload — os dois convergem porque `atendimento` é o objeto que carrega o `protocolo` |
 | `Subscriber.olt_id` (dentro de `find_subscriber`) | `GET /api/v1/integracao/rede/equipamento` | Sem endpoint dedicado — correlaciona `servicos[].interface.nome` (a PON do assinante, ex. `"PON5"`) com `equipamentos[].interfaces[].nome`; o equipamento dono é a OLT. Lista de equipamentos cacheada por instância (não muda por chamada); circuit breaker isolado (`_equipment_breaker`) para nunca travar chamadas críticas se `/rede/equipamento` cair |
@@ -45,6 +46,31 @@ implementados, entram como adapters de telemetria separados
 (`GenieACSAdapter`, `OLTSnmpAdapter`/`ZabbixAdapter`, spec §4.4), com o
 `CallOrchestrator`/`ToolExecutor` recebendo os dois (Hubsoft + adapter) em
 vez de um único `ISPConnector`.
+
+## `manage_visit` — agendar/reagendar/cancelar visita (OPS-02)
+
+Método dedicado do `ISPConnector` (spec §2.1: "Agendamento / reagendamento
+/ cancelamento de visita técnica" é um único intent do catálogo, mas as
+três ações têm contratos reais bem diferentes). Substitui o reaproveitamento
+de `create_service_order` que a v1 deste conector usava como simplificação
+de MVP. Os três endpoints abaixo foram **verificados** contra
+`docs/source/ordem_servico/{agendar,reagendar,remover_agendamento}.rst`
+(github.com/hubsoftbrasil/api) — inclusive os exemplos de request/response.
+
+| Ação | Endpoint | Payload | Observação |
+|---|---|---|---|
+| `schedule` | `POST /ordem_servico/agendar` | `{"id_ordem_servico": ...}` | **Confirmado, não é omissão:** este endpoint não recebe janela de horário nenhuma — só confirma o agendamento de uma OS que já tem `data_inicio_programado` definido. Nenhuma das três ações cria uma OS do zero |
+| `reschedule` | `POST /ordem_servico/reagendar` | `id_ordem_servico` + `data_inicio_programado`/`hora_inicio_programado`/`data_termino_programado`/`hora_termino_programado` (mais `id_usuario_antigo`/`id_usuario_novo` opcionais, para reatribuir técnico — não expostos por este conector) | `VisitDraft.window_start`/`window_end` são obrigatórios; sem eles o conector recusa a chamada antes de bater na API |
+| `cancel` | `POST /ordem_servico/remove_agendamento` | `id_ordem_servico` + `id_motivo_remocao_agendamento` + `observacao` (mín. 10 caracteres) | Ver limitação do `id_motivo_remocao_agendamento` abaixo |
+
+**Limitação real, não contornável no código:** `id_motivo_remocao_agendamento`
+não tem catálogo fixo documentado — a doc oficial diz que os valores válidos
+"podem ser obtidos no endpoint `/ordem_servico/create`" do provedor (isto é,
+são configuráveis por instalação Hubsoft). Este conector não inventa um
+valor: `HUBSOFT_CANCEL_REASON_ID` no `.env` fica em branco por padrão, e
+`manage_visit(action=cancel)` recusa a chamada com um `ConnectorError`
+explícito até o provedor informar o ID correto (consultado uma vez,
+manualmente, contra o `/ordem_servico/create` do ambiente real).
 
 ## Limitações conhecidas desta implementação (documentadas em `# TODO` no código)
 
@@ -91,7 +117,12 @@ vez de um único `ISPConnector`.
 3. Validar a resolução de `olt_id` (via `/rede/equipamento`) contra o
    volume real de PONs do provedor — a correlação por nome de interface
    pode não ser 1:1 dependendo de como o provedor nomeia suas interfaces
-4. Definir de onde vem `cto_id`/`cpe_serial` (provavelmente ACS — ver
-   `docs/connectors/` quando o adapter for escrito) para destravar NET-03
+4. Configurar `GenieACSAdapter`/`ZabbixAdapter` (`docs/connectors/genieacs.md`/
+   `zabbix.md`) para resolver `cpe_serial`/`get_cpe_diagnostics`/
+   `reboot_cpe`/`get_area_incidents`, que continuam ausentes do ERP puro
 5. Validar o formato exato de `ordens_servico[]` em `POST /atendimento`
    com `abrir_os=true` contra uma resposta real
+6. Consultar `GET /ordem_servico/create` do ambiente real do provedor para
+   descobrir o `id_motivo_remocao_agendamento` correto e preencher
+   `HUBSOFT_CANCEL_REASON_ID` — sem isso, `manage_visit(action=cancel)`
+   não funciona

@@ -29,10 +29,10 @@ INTENT_TOOL_ALLOWLIST: dict[Intent, frozenset[str]] = {
     Intent.NET_01_SESSION_DIAGNOSIS: frozenset({"get_connection_status", "get_cpe_diagnostics"}),
     Intent.NET_04_REBOOT_CPE: frozenset({"reboot_cpe"}),
     Intent.OPS_01_SO_STATUS: frozenset({"list_service_orders"}),
-    # OPS-02 (agendamento) reaproveita a mesma tool de OPS-03: o ISPConnector
-    # ainda não tem um método dedicado de agendar/reagendar/cancelar visita
-    # (spec §2.1) — ver o comentário em `turn_manager._execute_service_order`.
-    Intent.OPS_02_SO_SCHEDULE: frozenset({"create_service_order"}),
+    # OPS-02 (agendar/reagendar/cancelar visita, spec §2.1) usa o método
+    # dedicado `manage_visit` — não reaproveita mais `create_service_order`
+    # (ver `turn_manager._handle_ops_02`/`_execute_visit_action`).
+    Intent.OPS_02_SO_SCHEDULE: frozenset({"manage_visit"}),
     Intent.OPS_03_SO_CREATE: frozenset({"create_service_order"}),
 }
 

@@ -61,7 +61,7 @@ Requer Python 3.12+.
 
 ```bash
 make install      # cria venv e instala em modo editável + deps de dev
-make test         # roda a suíte de testes (140 testes, sem infra externa — inclui SQLite in-memory)
+make test         # roda a suíte de testes (155 testes, sem infra externa — inclui SQLite in-memory)
 make up           # sobe Postgres + Redis via docker compose (só necessário com PERSISTENCE_ENABLED=true)
 make dev          # sobe a API de demonstração em http://localhost:8000
 ```
@@ -123,9 +123,8 @@ Implementado (Fase 1 do roadmap da spec, §10):
   qualquer classificação de intenção; "sim" chama `confirm_action(True)` (`→ EXECUTION`, só aí a
   tool destrutiva entra no allowlist) e executa de verdade; "não" cancela sem executar nada;
   resposta ambígua conta como falha de reconhecimento do slot (regra §7.1 #3) e escalona na 2ª
-  tentativa. OPS-02 reaproveita `create_service_order` (o `ISPConnector` ainda não tem um método
-  dedicado de agendar/reagendar/cancelar visita — fica para quando um ERP real definir esse
-  contrato)
+  tentativa. OPS-02 usa `manage_visit`, método dedicado do `ISPConnector` (ver item abaixo) — não
+  reaproveita mais `create_service_order`
 - **Adapters de ACS (`GenieACSAdapter`) e NMS (`ZabbixAdapter`)** (spec §4.4): implementam de
   verdade `get_cpe_diagnostics`/`reboot_cpe` (contra a NBI do GenieACS) e `get_area_incidents`
   (contra a API JSON-RPC do Zabbix) — os 3 métodos confirmadamente ausentes de qualquer ERP.
@@ -140,10 +139,21 @@ Implementado (Fase 1 do roadmap da spec, §10):
   (Zabbix) é feita via tag configurável, com fallback por nome — ambas as limitações documentadas
   em [`docs/connectors/genieacs.md`](./docs/connectors/genieacs.md) e
   [`docs/connectors/zabbix.md`](./docs/connectors/zabbix.md)
+- **`manage_visit`** — método dedicado do `ISPConnector` para OPS-02 (agendar/reagendar/cancelar
+  visita técnica, spec §2.1), substituindo o reaproveitamento de `create_service_order`. As três
+  ações da Hubsoft foram verificadas contra `ordem_servico/{agendar,reagendar,remover_agendamento}.rst`
+  (github.com/hubsoftbrasil/api): nenhuma cria uma OS do zero — todas exigem uma OS já existente;
+  `agendar` não recebe janela de horário (confirmado, não omissão); `reagendar` exige data/hora de
+  início e fim; `remove_agendamento` exige um `id_motivo_remocao_agendamento` sem catálogo fixo
+  documentado (`HUBSOFT_CANCEL_REASON_ID` no `.env`, sem valor inventado quando ausente). No
+  `CallOrchestrator`, a ação (agendar/reagendar/cancelar) é decidida por palavra-chave em
+  `_handle_ops_02` antes da confirmação verbal; reagendamento sem `tool_executor` configurado
+  escalona em vez de arriscar extrair a nova data sem LLM. Detalhes em
+  [`docs/connectors/hubsoft.md`](./docs/connectors/hubsoft.md)
 
 Pendente — próximas fases:
-1. Validar o `HubsoftConnector` contra um ambiente real do provedor piloto (a doc pública não cobre tudo — ver limitações em `docs/connectors/hubsoft.md`); escrever `IXCSoftConnector`/`VoalleConnector` se o piloto for outro ERP; validar `GenieACSAdapter`/`ZabbixAdapter` contra ACS/NMS reais do provedor (ver "Quando houver acesso a um ambiente real" nos respectivos docs)
-2. Adicionar ao `ISPConnector` um método dedicado de agendar/reagendar/cancelar visita técnica, para OPS-02 parar de reaproveitar `create_service_order`
+1. Validar o `HubsoftConnector` contra um ambiente real do provedor piloto (a doc pública não cobre tudo — ver limitações em `docs/connectors/hubsoft.md`); escrever `IXCSoftConnector`/`VoalleConnector` se o piloto for outro ERP; validar `GenieACSAdapter`/`ZabbixAdapter`/`manage_visit` contra ACS/NMS/ERP reais do provedor (ver "Quando houver acesso a um ambiente real" nos respectivos docs)
+2. Reagendamento de visita (OPS-02) exige `LLM_PROVIDER=anthropic` para extrair data/hora da fala do cliente — sem isso, escalona sempre; considerar um slot-filling determinístico dedicado se o piloto não usar LLM real
 3. ASR/TTS de produção (Deepgram/Azure + ElevenLabs/Cartesia) e voice runtime (LiveKit Agents ou Pipecat) ligado a Asterisk/Kamailio
 4. Migração real (Alembic) em vez do `create_all` de conveniência usado hoje no boot da API
 5. Parecer jurídico formal (Decreto 11.034, RGC, LGPD) antes de qualquer go-live — ver spec §6

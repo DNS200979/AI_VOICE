@@ -26,6 +26,12 @@ class Settings(BaseSettings):
     hubsoft_client_secret: str = ""
     hubsoft_username: str = ""
     hubsoft_password: str = ""
+    # `id_motivo_remocao_agendamento` exigido por `ordem_servico/remove_agendamento`
+    # (cancelamento de visita, OPS-02). A Hubsoft não documenta um catálogo
+    # fixo desses IDs — só aparecem em GET /ordem_servico/create do
+    # provedor. 0 (padrão) = manage_visit(action=cancel) recusa a chamada
+    # com erro explícito em vez de mandar um motivo inventado.
+    hubsoft_cancel_reason_id: int = 0
 
     # --- ACS (ver docs/connectors/genieacs.md) — fonte de get_cpe_diagnostics/
     # reboot_cpe (spec §4.4). "none" (padrão) = ISPConnector.get_cpe_diagnostics/

@@ -1,8 +1,18 @@
 """Testes de contrato do conector mock — mesma bateria que qualquer
 conector real (Hubsoft, IXC, SGP, Voalle) deve passar (spec §4.4)."""
-from voxisp.connectors.base import ISPConnector
+from datetime import UTC, datetime
+
+import pytest
+
+from voxisp.connectors.base import ConnectorError, ISPConnector
 from voxisp.connectors.mock import MockISPConnector
-from voxisp.connectors.models import InvoiceStatus
+from voxisp.connectors.models import (
+    InvoiceStatus,
+    ServiceOrderStatus,
+    SODraft,
+    VisitAction,
+    VisitDraft,
+)
 
 
 def test_mock_implements_protocol():
@@ -50,3 +60,57 @@ async def test_create_protocol_has_number():
     connector = MockISPConnector()
     protocol = await connector.create_protocol("sub-001", "teste")
     assert protocol.protocol_number
+
+
+async def test_manage_visit_schedule_marks_order_scheduled():
+    connector = MockISPConnector()
+    so = await connector.create_service_order(
+        SODraft(subscriber_id="sub-001", category="visita_tecnica", summary="teste")
+    )
+
+    updated = await connector.manage_visit(
+        VisitDraft(subscriber_id="sub-001", action=VisitAction.SCHEDULE, service_order_id=so.id)
+    )
+
+    assert updated.status == ServiceOrderStatus.SCHEDULED
+
+
+async def test_manage_visit_reschedule_updates_window():
+    connector = MockISPConnector()
+    so = await connector.create_service_order(
+        SODraft(subscriber_id="sub-001", category="visita_tecnica", summary="teste")
+    )
+
+    updated = await connector.manage_visit(
+        VisitDraft(
+            subscriber_id="sub-001",
+            action=VisitAction.RESCHEDULE,
+            service_order_id=so.id,
+            window_start=datetime(2026, 9, 1, 14, 0, tzinfo=UTC),
+        )
+    )
+
+    assert updated.status == ServiceOrderStatus.SCHEDULED
+    assert updated.scheduled_window is not None
+    assert "01/09" in updated.scheduled_window
+
+
+async def test_manage_visit_cancel_marks_order_cancelled():
+    connector = MockISPConnector()
+    so = await connector.create_service_order(
+        SODraft(subscriber_id="sub-001", category="visita_tecnica", summary="teste")
+    )
+
+    updated = await connector.manage_visit(
+        VisitDraft(subscriber_id="sub-001", action=VisitAction.CANCEL, service_order_id=so.id)
+    )
+
+    assert updated.status == ServiceOrderStatus.CANCELLED
+
+
+async def test_manage_visit_unknown_order_raises():
+    connector = MockISPConnector()
+    with pytest.raises(ConnectorError):
+        await connector.manage_visit(
+            VisitDraft(subscriber_id="sub-001", action=VisitAction.SCHEDULE, service_order_id="os-inexistente")
+        )

@@ -3,6 +3,8 @@ continua correto (mesmo resultado do §7.2) quando os diagnósticos vêm de um
 loop real de tool-calling do Claude em vez de chamadas diretas ao conector.
 """
 from voxisp.connectors.mock import MockISPConnector
+from voxisp.connectors.models import SODraft
+from voxisp.fsm.states import CallState
 from voxisp.orchestrator.llm_client import StubLLMClient
 from voxisp.orchestrator.tool_executor import ToolExecutor
 from voxisp.orchestrator.turn_manager import CallOrchestrator
@@ -183,18 +185,12 @@ async def test_net04_confirmed_execution_via_tool_executor():
 
 
 async def test_ops02_confirmed_execution_via_tool_executor():
+    """OPS-02 usa o método dedicado `manage_visit` (não mais
+    `create_service_order`) — a ação (agendar/reagendar/cancelar) é
+    injetada por `extra_context`, nunca escolhida pelo modelo."""
     connector = MockISPConnector()
     responses = [
-        _FakeResponse(
-            [
-                _FakeBlock(
-                    "tool_use",
-                    id="c1",
-                    name="create_service_order",
-                    input={"category": "visita_tecnica", "summary": "Agendamento solicitado pelo cliente"},
-                )
-            ]
-        ),
+        _FakeResponse([_FakeBlock("tool_use", id="c1", name="manage_visit", input={})]),
         _FakeResponse([_FakeBlock("text", text="ok")]),
     ]
     tool_executor = ToolExecutor(client=_FakeAnthropicClient(responses), connector=connector)
@@ -208,7 +204,44 @@ async def test_ops02_confirmed_execution_via_tool_executor():
 
     assert result.escalate is False
     assert result.protocol_number is not None
-    assert "OPS-02.create_service_order(via-llm)" in orch._diagnostics
+    assert "OPS-02.manage_visit(via-llm)" in orch._diagnostics
+
+
+async def test_ops02_reschedule_extracts_window_via_tool_executor():
+    """Com tool_executor configurado, reagendamento não escalona — o
+    modelo extrai window_start/window_end da fala do cliente."""
+    connector = MockISPConnector()
+    responses = [
+        _FakeResponse(
+            [
+                _FakeBlock(
+                    "tool_use",
+                    id="c1",
+                    name="manage_visit",
+                    input={"window_start": "2026-09-01T14:00:00", "window_end": "2026-09-01T15:00:00"},
+                )
+            ]
+        ),
+        _FakeResponse([_FakeBlock("text", text="ok")]),
+    ]
+    tool_executor = ToolExecutor(client=_FakeAnthropicClient(responses), connector=connector)
+
+    orch = CallOrchestrator(connector=connector, llm=StubLLMClient(), tool_executor=tool_executor)
+    await orch.greet()
+    await orch.identify("111.444.777-35")
+    # reagendar exige uma OS já existente — manage_visit nunca cria uma do zero.
+    await connector.create_service_order(
+        SODraft(subscriber_id="sub-001", category="visita_tecnica", summary="Visita já agendada")
+    )
+    first = await orch.handle_utterance("quero reagendar visita para dia 1 de setembro às 14h")
+    assert first.escalate is False
+    assert orch.fsm.state == CallState.CONFIRMATION
+
+    result = await orch.handle_utterance("sim")
+
+    assert result.escalate is False
+    assert result.protocol_number is not None
+    assert "OPS-02.manage_visit(via-llm)" in orch._diagnostics
 
 
 async def test_ops03_confirmed_execution_via_tool_executor():

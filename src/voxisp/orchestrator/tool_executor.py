@@ -26,10 +26,11 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from voxisp.connectors.base import ISPConnector
-from voxisp.connectors.models import SODraft, Subscriber
+from voxisp.connectors.models import SODraft, Subscriber, VisitAction, VisitDraft
 from voxisp.fsm.states import CallState, Intent
 from voxisp.orchestrator.tool_allowlist import allowed_tools_for_state
 from voxisp.orchestrator.tools import TOOL_CATALOG, ToolSpec
@@ -44,6 +45,19 @@ MAX_TOOL_LOOP_TURNS = 4
 class ToolAllowlistViolation(Exception):
     """Nenhuma tool está autorizada para o intent/estado atual — o loop
     nem chega a consultar o Claude."""
+
+
+def _parse_model_datetime(value: str | None) -> datetime | None:
+    """`window_start`/`window_end` de `manage_visit` vêm do modelo como
+    texto livre em ISO 8601 — nunca deixa uma data malformada estourar o
+    loop de tool-calling, só descarta (o conector real recusa a chamada
+    se faltar um campo obrigatório, com um erro explícito)."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
 
 
 @dataclass
@@ -78,6 +92,7 @@ class ToolExecutor:
         intent: Intent,
         state: CallState,
         instructions: str,
+        extra_context: dict[str, Any] | None = None,
     ) -> ToolExecutionResult:
         allowed = allowed_tools_for_state(state, intent)
         if not allowed:
@@ -88,6 +103,7 @@ class ToolExecutor:
         tool_defs = [spec.to_claude_tool() for name, spec in TOOL_CATALOG.items() if name in allowed]
         messages: list[dict] = [{"role": "user", "content": instructions}]
         result = ToolExecutionResult()
+        extra_context = extra_context or {}
 
         for _ in range(self._max_turns):
             response = await self._client.with_options(timeout=self._timeout_s).messages.create(
@@ -121,7 +137,7 @@ class ToolExecutor:
 
                 spec = TOOL_CATALOG[block.name]
                 try:
-                    output = await self._execute(spec, subscriber, block.input)
+                    output = await self._execute(spec, subscriber, block.input, extra_context)
                 except Exception as exc:  # noqa: BLE001 - erro de conector vira tool_result de erro
                     tool_results.append(
                         {"type": "tool_result", "tool_use_id": block.id, "content": str(exc), "is_error": True}
@@ -137,10 +153,13 @@ class ToolExecutor:
 
         raise TimeoutError(f"loop de tool-calling excedeu {self._max_turns} turnos sem concluir")
 
-    async def _execute(self, spec: ToolSpec, subscriber: Subscriber, model_input: dict) -> dict:
+    async def _execute(
+        self, spec: ToolSpec, subscriber: Subscriber, model_input: dict, extra_context: dict[str, Any]
+    ) -> dict:
         """Injeta dados de contexto (subscriber_id, cpe_serial,
-        idempotency_key) que o modelo NUNCA controla — só os campos
-        declarados no `input_schema` da tool vêm de `model_input`."""
+        idempotency_key, e o que vier em `extra_context`) que o modelo NUNCA
+        controla — só os campos declarados no `input_schema` da tool vêm de
+        `model_input`."""
         connector = self._connector
         name = spec.connector_method
 
@@ -178,6 +197,24 @@ class ToolExecutor:
                 preferred_window=model_input.get("preferred_window"),
             )
             service_order = await connector.create_service_order(draft)
+            return service_order.model_dump(mode="json")
+        if name == "manage_visit":
+            # action/service_order_id são decididos pelo `turn_manager` antes
+            # da confirmação (nunca pelo modelo) — o modelo só preenche
+            # window_start/window_end/reason, extraídos do que o cliente disse.
+            action = extra_context.get("visit_action")
+            service_order_id = extra_context.get("visit_service_order_id")
+            if action is None or service_order_id is None:
+                return {"error": "contexto de agendamento de visita ausente"}
+            visit_draft = VisitDraft(
+                subscriber_id=subscriber.id,
+                action=VisitAction(action),
+                service_order_id=service_order_id,
+                window_start=_parse_model_datetime(model_input.get("window_start")),
+                window_end=_parse_model_datetime(model_input.get("window_end")),
+                reason=model_input.get("reason"),
+            )
+            service_order = await connector.manage_visit(visit_draft)
             return service_order.model_dump(mode="json")
 
         raise ValueError(f"tool '{spec.name}' sem dispatcher implementado em ToolExecutor._execute")

@@ -26,6 +26,7 @@ from voxisp.connectors.models import (
     SODraft,
     Subscriber,
     UnlockResult,
+    VisitDraft,
 )
 from voxisp.connectors.models import (
     Protocol as ProtocolRecord,
@@ -66,6 +67,9 @@ class ConnectorHub(ISPConnector):
 
     async def create_service_order(self, payload: SODraft) -> ServiceOrder:
         return await self._erp.create_service_order(payload)
+
+    async def manage_visit(self, draft: VisitDraft) -> ServiceOrder:
+        return await self._erp.manage_visit(draft)
 
     async def create_protocol(self, subscriber_id: str, summary: str) -> ProtocolRecord:
         return await self._erp.create_protocol(subscriber_id, summary)

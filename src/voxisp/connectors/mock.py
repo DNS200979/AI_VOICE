@@ -28,6 +28,7 @@ from voxisp.connectors.models import (
     SODraft,
     Subscriber,
     UnlockResult,
+    VisitDraft,
 )
 from voxisp.connectors.models import (
     Protocol as ProtocolRecord,
@@ -88,8 +89,6 @@ _INVOICES: dict[str, list[Invoice]] = {
 _ONU_STATE: dict[str, ONUStatus] = {"sub-001": ONUStatus.LOS, "sub-002": ONUStatus.ONLINE}
 _MASSIVE_LOS_COUNT_BY_PON = {"OLT-01:PON-04": 7}
 
-_SERVICE_ORDERS: dict[str, list[ServiceOrder]] = {"sub-001": [], "sub-002": []}
-
 
 def _idem(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:12]}"
@@ -103,6 +102,15 @@ def _protocol_number() -> str:
 
 class MockISPConnector(ISPConnector):
     """Implementação de referência do contrato `ISPConnector`."""
+
+    def __init__(self) -> None:
+        # Por instância (não módulo): duas instâncias em testes diferentes
+        # não podem enxergar as OS uma da outra — `manage_visit` passou a
+        # depender de "existe uma OS aberta?" para decidir o que fazer, o
+        # que tornaria um dict de módulo compartilhado uma fonte real de
+        # flakiness entre testes (mesma classe de bug já corrigida antes
+        # neste projeto para `Subscriber` mutável).
+        self._service_orders: dict[str, list[ServiceOrder]] = {"sub-001": [], "sub-002": []}
 
     async def find_subscriber(
         self, cpf: str | None = None, phone: str | None = None
@@ -180,7 +188,7 @@ class MockISPConnector(ISPConnector):
         return ActionResult(success=True, idempotency_key=idempotency_key, message="Reboot enviado via TR-069")
 
     async def list_service_orders(self, subscriber_id: str) -> list[ServiceOrder]:
-        return _SERVICE_ORDERS.get(subscriber_id, [])
+        return self._service_orders.get(subscriber_id, [])
 
     async def create_service_order(self, payload: SODraft) -> ServiceOrder:
         so = ServiceOrder(
@@ -192,8 +200,28 @@ class MockISPConnector(ISPConnector):
             technician=None,
             created_at=datetime.now(UTC),
         )
-        _SERVICE_ORDERS.setdefault(payload.subscriber_id, []).append(so)
+        self._service_orders.setdefault(payload.subscriber_id, []).append(so)
         return so
+
+    async def manage_visit(self, draft: VisitDraft) -> ServiceOrder:
+        orders = self._service_orders.get(draft.subscriber_id, [])
+        for i, so in enumerate(orders):
+            if so.id != draft.service_order_id:
+                continue
+            if draft.action.value == "cancel":
+                updated = so.model_copy(update={"status": ServiceOrderStatus.CANCELLED})
+            elif draft.action.value == "reschedule":
+                window = f"{draft.window_start:%d/%m %H:%M}" if draft.window_start else so.scheduled_window
+                updated = so.model_copy(
+                    update={"status": ServiceOrderStatus.SCHEDULED, "scheduled_window": window}
+                )
+            else:  # schedule
+                updated = so.model_copy(update={"status": ServiceOrderStatus.SCHEDULED})
+            orders[i] = updated
+            return updated
+        raise ConnectorError(
+            f"ordem de serviço {draft.service_order_id} não encontrada para {draft.subscriber_id}"
+        )
 
     async def get_area_incidents(self, olt_id: str, pon: str) -> list[Incident]:
         key = f"{olt_id}:{pon}"

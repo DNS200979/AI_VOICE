@@ -35,6 +35,8 @@ from voxisp.connectors.models import (
     SODraft,
     Subscriber,
     UnlockResult,
+    VisitAction,
+    VisitDraft,
 )
 from voxisp.connectors.models import (
     Protocol as ProtocolRecord,
@@ -133,6 +135,13 @@ class HubsoftConnector(ISPConnector):
       `POST /atendimento` com `abrir_os=true`, que também é o endpoint que
       emite o protocolo (`create_protocol`) — os dois métodos convergem no
       mesmo endpoint real, variando o payload.
+    - `manage_visit` (agendar/reagendar/cancelar visita, OPS-02) usa os 3
+      endpoints reais e confirmados de `ordem_servico/`: `agendar` (só
+      `id_ordem_servico`, sem janela — confirma o agendamento de uma OS que
+      já tem `data_inicio_programado`), `reagendar` (exige janela nova de
+      início/fim) e `remove_agendamento` (exige `id_motivo_remocao_agendamento`,
+      sem catálogo fixo — ver `docs/connectors/hubsoft.md`). As três operam
+      sobre uma OS já existente, nunca criam uma do zero.
     - Diagnóstico/reboot de CPE e correlação de incidente de rede
       (`get_cpe_diagnostics`, `reboot_cpe`, `get_area_incidents`) não
       existem na Hubsoft — vêm de ACS/NMS, fora do escopo deste conector.
@@ -525,6 +534,66 @@ class HubsoftConnector(ISPConnector):
             technician=None,
             created_at=datetime.now(UTC),
         )
+
+    async def manage_visit(self, draft: VisitDraft) -> ServiceOrder:
+        """Agenda/reagenda/cancela uma visita técnica (OPS-02) contra os 3
+        endpoints reais e confirmados `ordem_servico/agendar`,
+        `/reagendar` e `/remove_agendamento`. Nenhum dos três cria uma OS
+        — todos exigem `draft.service_order_id` de uma OS já existente
+        (confirmado pela doc, ver docstring da classe)."""
+        if draft.action == VisitAction.SCHEDULE:
+            data = await self._request(
+                "POST",
+                "/api/v1/integracao/ordem_servico/agendar",
+                json_body={"id_ordem_servico": draft.service_order_id},
+            )
+        elif draft.action == VisitAction.RESCHEDULE:
+            if draft.window_start is None or draft.window_end is None:
+                raise ConnectorError(
+                    "reagendamento exige window_start e window_end — a Hubsoft "
+                    "(ordem_servico/reagendar) exige data/hora de início e término"
+                )
+            data = await self._request(
+                "POST",
+                "/api/v1/integracao/ordem_servico/reagendar",
+                json_body={
+                    "id_ordem_servico": draft.service_order_id,
+                    "data_inicio_programado": draft.window_start.strftime("%Y-%m-%d"),
+                    "hora_inicio_programado": draft.window_start.strftime("%H:%M:%S"),
+                    "data_termino_programado": draft.window_end.strftime("%Y-%m-%d"),
+                    "hora_termino_programado": draft.window_end.strftime("%H:%M:%S"),
+                },
+            )
+        elif draft.action == VisitAction.CANCEL:
+            if not draft.reason or len(draft.reason.strip()) < 10:
+                raise ConnectorError(
+                    "cancelamento exige reason com pelo menos 10 caracteres — a "
+                    "Hubsoft (ordem_servico/remove_agendamento) exige uma "
+                    "'observacao' com esse mínimo"
+                )
+            if not self._settings.hubsoft_cancel_reason_id:
+                raise ConnectorError(
+                    "HUBSOFT_CANCEL_REASON_ID não configurado no .env — a Hubsoft "
+                    "exige id_motivo_remocao_agendamento e NÃO tem um catálogo fixo "
+                    "documentado (só disponível em GET /ordem_servico/create do "
+                    "provedor). Ver docs/connectors/hubsoft.md."
+                )
+            data = await self._request(
+                "POST",
+                "/api/v1/integracao/ordem_servico/remove_agendamento",
+                json_body={
+                    "id_ordem_servico": draft.service_order_id,
+                    "id_motivo_remocao_agendamento": self._settings.hubsoft_cancel_reason_id,
+                    "observacao": draft.reason,
+                },
+            )
+        else:
+            raise ConnectorError(f"ação de visita desconhecida: {draft.action}")
+
+        raw_so = data.get("ordem_servico")
+        if raw_so is None:
+            raise ConnectorError(f"Hubsoft não retornou ordem_servico em manage_visit: {data.get('msg')}")
+        return self._parse_service_order(raw_so, draft.subscriber_id)
 
     async def get_area_incidents(self, olt_id: str, pon: str) -> list[Incident]:
         raise NotImplementedError(_NOT_AVAILABLE_IN_HUBSOFT.format(method="get_area_incidents"))

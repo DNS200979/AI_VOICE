@@ -31,7 +31,7 @@ def test_all_destructive_intents_gated_the_same_way():
     NET-04 (reboot), OPS-02 (agendamento) e OPS-03 (abertura de OS)."""
     for intent, expected in (
         (Intent.NET_04_REBOOT_CPE, {"reboot_cpe"}),
-        (Intent.OPS_02_SO_SCHEDULE, {"create_service_order"}),
+        (Intent.OPS_02_SO_SCHEDULE, {"manage_visit"}),
         (Intent.OPS_03_SO_CREATE, {"create_service_order"}),
     ):
         assert allowed_tools_for_state(CallState.CONFIRMATION, intent) == frozenset()

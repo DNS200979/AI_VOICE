@@ -3,7 +3,7 @@ simulando as respostas documentadas em docs.hubsoft.com.br /
 github.com/hubsoftbrasil/api (payloads copiados dos exemplos oficiais).
 """
 import json as _json
-from datetime import date
+from datetime import UTC, date, datetime
 
 import httpx
 import pytest
@@ -20,7 +20,13 @@ from voxisp.connectors.hubsoft import (
     _parse_br_date,
     _parse_radius_datetime,
 )
-from voxisp.connectors.models import InvoiceStatus, ServiceOrderStatus, SODraft
+from voxisp.connectors.models import (
+    InvoiceStatus,
+    ServiceOrderStatus,
+    SODraft,
+    VisitAction,
+    VisitDraft,
+)
 
 AUTH_RESPONSE = {
     "access_token": "fake-access-token",
@@ -125,6 +131,29 @@ EQUIPAMENTO_RESPONSE = {
 }
 
 EQUIPAMENTO_RESPONSE_EMPTY = {"status": "success", "msg": "Dados consultados com sucesso.", "equipamentos": []}
+
+# Payloads reais de exemplo — ordem_servico/agendar.rst, reagendar.rst e
+# remover_agendamento.rst (github.com/hubsoftbrasil/api).
+AGENDAR_RESPONSE = {
+    "status": "success",
+    "msg": "Agendamento salvo com sucesso",
+    "ordem_servico": {"id_ordem_servico": 1493, "numero": "1262", "status": "Pendente"},
+}
+REAGENDAR_RESPONSE = {
+    "status": "success",
+    "msg": "Reagendamento salvo com sucesso",
+    "ordem_servico": {
+        "id_ordem_servico": 1493,
+        "numero": "1262",
+        "status": "Pendente",
+        "data_inicio_programado": "2020-11-23 08:00",
+    },
+}
+REMOVE_AGENDAMENTO_RESPONSE = {
+    "status": "success",
+    "msg": "Remoção do agendamento feito com sucesso",
+    "ordem_servico": {"id_ordem_servico": 1493, "numero": "1262", "status": "cancelado"},
+}
 
 
 def _configured_settings(**overrides) -> Settings:
@@ -494,6 +523,110 @@ async def test_create_service_order_via_atendimento_endpoint():
 
     assert so.id == "1493"
     assert so.category == "sem_sinal"
+
+
+# -- manage_visit (OPS-02: agendar/reagendar/cancelar visita) ----------------
+
+
+async def test_manage_visit_schedule_calls_agendar_endpoint():
+    def data_handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v1/integracao/ordem_servico/agendar"
+        assert _json.loads(request.read()) == {"id_ordem_servico": "1493"}
+        return httpx.Response(200, json=AGENDAR_RESPONSE)
+
+    connector = _connector_with(data_handler)
+    so = await connector.manage_visit(
+        VisitDraft(subscriber_id="11201", action=VisitAction.SCHEDULE, service_order_id="1493")
+    )
+
+    assert so.id == "1493"
+    assert so.status == ServiceOrderStatus.OPEN  # "Pendente" -> OPEN
+
+
+async def test_manage_visit_reschedule_calls_reagendar_with_window():
+    def data_handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v1/integracao/ordem_servico/reagendar"
+        body = _json.loads(request.read())
+        assert body == {
+            "id_ordem_servico": "1493",
+            "data_inicio_programado": "2020-11-23",
+            "hora_inicio_programado": "08:00:00",
+            "data_termino_programado": "2020-11-23",
+            "hora_termino_programado": "09:30:00",
+        }
+        return httpx.Response(200, json=REAGENDAR_RESPONSE)
+
+    connector = _connector_with(data_handler)
+    so = await connector.manage_visit(
+        VisitDraft(
+            subscriber_id="11201",
+            action=VisitAction.RESCHEDULE,
+            service_order_id="1493",
+            window_start=datetime(2020, 11, 23, 8, 0, tzinfo=UTC),
+            window_end=datetime(2020, 11, 23, 9, 30, tzinfo=UTC),
+        )
+    )
+
+    assert so.id == "1493"
+
+
+async def test_manage_visit_reschedule_without_window_raises():
+    connector = _connector_with(lambda r: pytest.fail("não deveria chamar a API"))
+    with pytest.raises(ConnectorError, match="window_start"):
+        await connector.manage_visit(
+            VisitDraft(subscriber_id="11201", action=VisitAction.RESCHEDULE, service_order_id="1493")
+        )
+
+
+async def test_manage_visit_cancel_calls_remove_agendamento():
+    def data_handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v1/integracao/ordem_servico/remove_agendamento"
+        body = _json.loads(request.read())
+        assert body == {
+            "id_ordem_servico": "1493",
+            "id_motivo_remocao_agendamento": 8,
+            "observacao": "Cliente resolveu sozinho, não precisa mais da visita",
+        }
+        return httpx.Response(200, json=REMOVE_AGENDAMENTO_RESPONSE)
+
+    connector = HubsoftConnector(
+        _configured_settings(hubsoft_cancel_reason_id=8),
+        client=httpx.AsyncClient(transport=httpx.MockTransport(_auth_aware_handler(data_handler))),
+    )
+    so = await connector.manage_visit(
+        VisitDraft(
+            subscriber_id="11201",
+            action=VisitAction.CANCEL,
+            service_order_id="1493",
+            reason="Cliente resolveu sozinho, não precisa mais da visita",
+        )
+    )
+
+    assert so.status == ServiceOrderStatus.CANCELLED
+
+
+async def test_manage_visit_cancel_without_reason_raises():
+    connector = HubsoftConnector(
+        _configured_settings(hubsoft_cancel_reason_id=8),
+        client=httpx.AsyncClient(transport=httpx.MockTransport(_auth_aware_handler(lambda r: pytest.fail("não deveria chamar a API")))),
+    )
+    with pytest.raises(ConnectorError, match="reason"):
+        await connector.manage_visit(
+            VisitDraft(subscriber_id="11201", action=VisitAction.CANCEL, service_order_id="1493", reason="curto")
+        )
+
+
+async def test_manage_visit_cancel_without_reason_id_configured_raises():
+    connector = _connector_with(lambda r: pytest.fail("não deveria chamar a API"))
+    with pytest.raises(ConnectorError, match="HUBSOFT_CANCEL_REASON_ID"):
+        await connector.manage_visit(
+            VisitDraft(
+                subscriber_id="11201",
+                action=VisitAction.CANCEL,
+                service_order_id="1493",
+                reason="Cliente não quer mais receber a visita técnica",
+            )
+        )
 
 
 async def test_create_protocol_via_atendimento_endpoint():

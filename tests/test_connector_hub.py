@@ -7,7 +7,16 @@ from datetime import UTC, datetime
 from voxisp.connectors.base import ISPConnector
 from voxisp.connectors.hub import ConnectorHub
 from voxisp.connectors.mock import MockISPConnector
-from voxisp.connectors.models import ActionResult, CPEDiagnostics, Incident, ONUStatus
+from voxisp.connectors.models import (
+    ActionResult,
+    CPEDiagnostics,
+    Incident,
+    ONUStatus,
+    ServiceOrderStatus,
+    SODraft,
+    VisitAction,
+    VisitDraft,
+)
 
 
 class _FakeACS:
@@ -91,3 +100,22 @@ async def test_hub_erp_only_methods_always_delegate_regardless_of_adapters():
     assert subscriber.id == "sub-001"
     assert isinstance(invoices, list)
     assert protocol.protocol_number
+
+
+async def test_hub_manage_visit_always_delegates_to_erp():
+    """`manage_visit` é domínio de ERP (agendamento de OS), não ACS/NMS —
+    o Hub delega direto, sem composição especial, mesmo com adapters
+    configurados."""
+    erp = MockISPConnector()
+    hub = ConnectorHub(erp, acs=_FakeACS(), nms=_FakeNMS())
+
+    subscriber = await hub.find_subscriber(cpf="11144477735")
+    so = await hub.create_service_order(
+        SODraft(subscriber_id=subscriber.id, category="visita_tecnica", summary="teste")
+    )
+
+    updated = await hub.manage_visit(
+        VisitDraft(subscriber_id=subscriber.id, action=VisitAction.SCHEDULE, service_order_id=so.id)
+    )
+
+    assert updated.status == ServiceOrderStatus.SCHEDULED

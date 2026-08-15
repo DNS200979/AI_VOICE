@@ -129,4 +129,36 @@ TOOL_CATALOG: dict[str, ToolSpec] = {
         },
         connector_method="create_service_order",
     ),
+    "manage_visit": ToolSpec(
+        name="manage_visit",
+        description=(
+            "Agenda, reagenda ou cancela a visita técnica (ordem de serviço) do "
+            "assinante desta ligação. A AÇÃO (agendar/reagendar/cancelar) já foi "
+            "decidida pela conversa antes desta chamada — não escolha a ação, só "
+            "preencha os campos que ela precisa: window_start/window_end (data e "
+            "hora em ISO 8601) quando for reagendamento; reason (motivo relatado "
+            "pelo cliente, mínimo 10 caracteres) quando for cancelamento. Para "
+            "agendamento simples, chame sem argumentos. Ação destrutiva — só "
+            "disponível depois que o cliente confirmar verbalmente."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "window_start": {
+                    "type": "string",
+                    "description": "Data/hora de início da nova janela, ISO 8601 — só para reagendamento",
+                },
+                "window_end": {
+                    "type": "string",
+                    "description": "Data/hora de término da nova janela, ISO 8601 — só para reagendamento",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Motivo do cancelamento relatado pelo cliente — só para cancelamento",
+                },
+            },
+            "additionalProperties": False,
+        },
+        connector_method="manage_visit",
+    ),
 }
