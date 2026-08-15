@@ -61,7 +61,7 @@ Requer Python 3.12+.
 
 ```bash
 make install      # cria venv e instala em modo editável + deps de dev
-make test         # roda a suíte de testes (115 testes, sem infra externa — inclui SQLite in-memory)
+make test         # roda a suíte de testes (140 testes, sem infra externa — inclui SQLite in-memory)
 make up           # sobe Postgres + Redis via docker compose (só necessário com PERSISTENCE_ENABLED=true)
 make dev          # sobe a API de demonstração em http://localhost:8000
 ```
@@ -126,9 +126,23 @@ Implementado (Fase 1 do roadmap da spec, §10):
   tentativa. OPS-02 reaproveita `create_service_order` (o `ISPConnector` ainda não tem um método
   dedicado de agendar/reagendar/cancelar visita — fica para quando um ERP real definir esse
   contrato)
+- **Adapters de ACS (`GenieACSAdapter`) e NMS (`ZabbixAdapter`)** (spec §4.4): implementam de
+  verdade `get_cpe_diagnostics`/`reboot_cpe` (contra a NBI do GenieACS) e `get_area_incidents`
+  (contra a API JSON-RPC do Zabbix) — os 3 métodos confirmadamente ausentes de qualquer ERP.
+  Compostos por um novo `ConnectorHub`, que `get_connector()` sempre devolve: delega
+  `get_cpe_diagnostics`/`reboot_cpe`/`get_area_incidents` para o adapter configurado
+  (`ACS_PROVIDER=genieacs`/`NMS_PROVIDER=zabbix`) e cai de volta no ERP (Mock ou Hubsoft) quando
+  nenhum adapter está configurado — passthrough transparente, `MockISPConnector` continua
+  funcionando exatamente como antes. `massive_detection.check_massive_incident` degrada
+  graciosamente (`is_massive=False`) se `get_area_incidents` levantar `NotImplementedError` ou
+  `ConnectorError`, em vez de derrubar a chamada. RX power de ONT não tem path TR-181 universal
+  (varia por fabricante — Huawei/ZTE/Nokia cobertos) e a correlação `olt_id` (ERP) ↔ `hostid`
+  (Zabbix) é feita via tag configurável, com fallback por nome — ambas as limitações documentadas
+  em [`docs/connectors/genieacs.md`](./docs/connectors/genieacs.md) e
+  [`docs/connectors/zabbix.md`](./docs/connectors/zabbix.md)
 
 Pendente — próximas fases:
-1. Validar o `HubsoftConnector` contra um ambiente real do provedor piloto (a doc pública não cobre tudo — ver limitações em `docs/connectors/hubsoft.md`); escrever `IXCSoftConnector`/`VoalleConnector` se o piloto for outro ERP; adapter de ACS para `cto_id`/`cpe_serial`/`get_cpe_diagnostics`/`reboot_cpe` e adapter de NMS para `get_area_incidents` — os dois são o que falta para destravar NET-03 com Hubsoft (`olt_id` já é resolvido via `/rede/equipamento`)
+1. Validar o `HubsoftConnector` contra um ambiente real do provedor piloto (a doc pública não cobre tudo — ver limitações em `docs/connectors/hubsoft.md`); escrever `IXCSoftConnector`/`VoalleConnector` se o piloto for outro ERP; validar `GenieACSAdapter`/`ZabbixAdapter` contra ACS/NMS reais do provedor (ver "Quando houver acesso a um ambiente real" nos respectivos docs)
 2. Adicionar ao `ISPConnector` um método dedicado de agendar/reagendar/cancelar visita técnica, para OPS-02 parar de reaproveitar `create_service_order`
 3. ASR/TTS de produção (Deepgram/Azure + ElevenLabs/Cartesia) e voice runtime (LiveKit Agents ou Pipecat) ligado a Asterisk/Kamailio
 4. Migração real (Alembic) em vez do `create_all` de conveniência usado hoje no boot da API

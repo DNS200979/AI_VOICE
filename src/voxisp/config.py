@@ -27,6 +27,28 @@ class Settings(BaseSettings):
     hubsoft_username: str = ""
     hubsoft_password: str = ""
 
+    # --- ACS (ver docs/connectors/genieacs.md) — fonte de get_cpe_diagnostics/
+    # reboot_cpe (spec §4.4). "none" (padrão) = ISPConnector.get_cpe_diagnostics/
+    # reboot_cpe caem no que o ERP escolhido já faz (Mock funciona; Hubsoft
+    # levanta NotImplementedError, confirmado que não existe no ERP).
+    acs_provider: str = "none"  # none | genieacs
+    genieacs_base_url: str = ""
+    genieacs_username: str = ""
+    genieacs_password: str = ""
+    # Sem padrão TR-181 universal de potência óptica (confirmado — varia por
+    # fabricante de ONT). Limiar de LOS em dBm: abaixo disso, ONUStatus.LOS.
+    genieacs_rx_power_los_threshold_dbm: float = -28.0
+
+    # --- NMS (ver docs/connectors/zabbix.md) — fonte de get_area_incidents
+    # (spec §4.4/§4.5). "none" (padrão) = mesmo fallback do ACS acima.
+    nms_provider: str = "none"  # none | zabbix
+    zabbix_base_url: str = ""
+    zabbix_username: str = ""
+    zabbix_password: str = ""
+    # Tag do host no Zabbix usada para correlacionar com o olt_id do ERP —
+    # ver docs/connectors/zabbix.md para o porquê dessa convenção.
+    zabbix_olt_tag_key: str = "olt_id"
+
     asr_provider: str = "stub"
     asr_api_key: str = ""
 

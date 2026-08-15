@@ -184,8 +184,12 @@ def test_hubsoft_requires_all_credentials(missing_field):
 
 
 def test_factory_wires_hubsoft_connector():
+    # get_connector() sempre devolve um ConnectorHub (spec §4.4) — sem
+    # ACS_PROVIDER/NMS_PROVIDER configurados, ele é um passthrough
+    # transparente para o HubsoftConnector por baixo.
     connector = get_connector("hubsoft", settings=_configured_settings())
-    assert isinstance(connector, HubsoftConnector)
+    assert isinstance(connector, ISPConnector)
+    assert isinstance(connector._erp, HubsoftConnector)
 
 
 # -- find_subscriber -------------------------------------------------------

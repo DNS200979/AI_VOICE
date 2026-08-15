@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from voxisp.connectors.base import ISPConnector
+from voxisp.connectors.base import ConnectorError, ISPConnector
 from voxisp.connectors.models import Incident, Subscriber
 
 DEFAULT_LOS_THRESHOLD = 3
@@ -44,7 +44,13 @@ async def check_massive_incident(
     if not subscriber.olt_id or not subscriber.pon:
         return MassiveCheckResult(is_massive=False)
 
-    incidents = await connector.get_area_incidents(subscriber.olt_id, subscriber.pon)
+    try:
+        incidents = await connector.get_area_incidents(subscriber.olt_id, subscriber.pon)
+    except (NotImplementedError, ConnectorError):
+        # Nenhum adapter de NMS configurado, ou o NMS real caiu (spec §4.4,
+        # degradação graciosa) — segue para diagnóstico individual em vez
+        # de derrubar a chamada.
+        return MassiveCheckResult(is_massive=False)
     if not incidents:
         return MassiveCheckResult(is_massive=False)
 
