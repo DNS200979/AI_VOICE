@@ -1,0 +1,150 @@
+##############################################################################
+# Stack de teste prévio para os adapters de ACS (GenieACS) e NMS (Zabbix) —
+# NÃO é infraestrutura de produção nem faz parte de `make up` (que sobe só
+# Postgres/Redis para a própria aplicação, ver `docker-compose.yml`).
+#
+# Objetivo: validar `GenieACSAdapter`/`ZabbixAdapter` (connectors/genieacs.py,
+# connectors/zabbix.py) contra software real, sem depender de um ISP piloto.
+# Ver docs/testing/local-integration-stack.md para o passo a passo completo.
+#
+# Imagens e variáveis verificadas contra:
+# - GenieACS/mongo/genieacs-sim: github.com/DrumSergio/genieacs-docker
+#   (community, mas é o compose oficialmente referenciado pela doc do
+#   próprio GenieACS para quem quer rodar via Docker)
+# - Zabbix: hub.docker.com/r/zabbix/zabbix-server-pgsql e
+#   hub.docker.com/r/zabbix/zabbix-web-nginx-pgsql (imagens oficiais do
+#   projeto Zabbix)
+##############################################################################
+services:
+  # -- GenieACS (ACS real) ---------------------------------------------------
+
+  genieacs-mongo:
+    image: mongo:8.0
+    container_name: voxisp-test-genieacs-mongo
+    restart: unless-stopped
+    environment:
+      MONGO_DATA_DIR: /data/db
+    volumes:
+      - genieacs_mongo_data:/data/db
+    networks:
+      - genieacs_test_net
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
+  genieacs:
+    image: drumsergio/genieacs:1.2.16.0
+    container_name: voxisp-test-genieacs
+    restart: unless-stopped
+    depends_on:
+      genieacs-mongo:
+        condition: service_healthy
+    environment:
+      GENIEACS_UI_JWT_SECRET: changeme-local-test-only
+      GENIEACS_MONGODB_CONNECTION_URL: mongodb://genieacs-mongo/genieacs?authSource=admin
+      GENIEACS_EXT_DIR: /opt/genieacs/ext
+    ports:
+      # NBI (REST) — é o que GENIEACS_BASE_URL do .env aponta.
+      - "7557:7557"
+      # CWMP — é para onde o CPE (real ou o simulador abaixo) se conecta.
+      - "7547:7547"
+      # File server (firmware) — não usado pelo GenieACSAdapter, exposto
+      # só para completude da stack.
+      - "7567:7567"
+      # UI web — útil para inspecionar visualmente o device simulado.
+      - "3000:3000"
+    volumes:
+      - genieacs_ext:/opt/genieacs/ext
+    networks:
+      - genieacs_test_net
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "--quiet", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # CPE simulado (TR-069) — finge ser uma ONU de verdade falando CWMP com o
+  # GenieACS acima. Sem isso, "/devices/" no NBI fica sempre vazio.
+  # Perfil "testing": só sobe com `--profile testing` (ver doc de uso).
+  genieacs-sim:
+    image: drumsergio/genieacs-sim-container:latest
+    container_name: voxisp-test-genieacs-sim
+    restart: unless-stopped
+    depends_on:
+      genieacs:
+        condition: service_healthy
+    networks:
+      - genieacs_test_net
+    profiles:
+      - testing
+
+  # -- Zabbix (NMS real) ------------------------------------------------------
+
+  zabbix-postgres:
+    image: postgres:16-alpine
+    container_name: voxisp-test-zabbix-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: zabbix
+      POSTGRES_PASSWORD: zabbix
+      POSTGRES_DB: zabbix
+    volumes:
+      - zabbix_pg_data:/var/lib/postgresql/data
+    networks:
+      - zabbix_test_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zabbix"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  zabbix-server:
+    image: zabbix/zabbix-server-pgsql:latest
+    container_name: voxisp-test-zabbix-server
+    restart: unless-stopped
+    depends_on:
+      zabbix-postgres:
+        condition: service_healthy
+    environment:
+      DB_SERVER_HOST: zabbix-postgres
+      POSTGRES_USER: zabbix
+      POSTGRES_PASSWORD: zabbix
+      POSTGRES_DB: zabbix
+    ports:
+      - "10051:10051"
+    networks:
+      - zabbix_test_net
+
+  zabbix-web:
+    image: zabbix/zabbix-web-nginx-pgsql:latest
+    container_name: voxisp-test-zabbix-web
+    restart: unless-stopped
+    depends_on:
+      - zabbix-server
+      - zabbix-postgres
+    environment:
+      DB_SERVER_HOST: zabbix-postgres
+      POSTGRES_USER: zabbix
+      POSTGRES_PASSWORD: zabbix
+      POSTGRES_DB: zabbix
+      ZBX_SERVER_HOST: zabbix-server
+      PHP_TZ: America/Sao_Paulo
+    ports:
+      # API JSON-RPC (ZABBIX_BASE_URL do .env) e UI web ficam no mesmo
+      # servidor nginx — /api_jsonrpc.php e /index.php respectivamente.
+      - "8080:8080"
+    networks:
+      - zabbix_test_net
+
+volumes:
+  genieacs_mongo_data:
+  genieacs_ext:
+  zabbix_pg_data:
+
+networks:
+  genieacs_test_net:
+  zabbix_test_net:

@@ -82,6 +82,29 @@ curl -s -X POST localhost:8000/calls/<call_id>/utterance \
 
 Copie `.env.example` para `.env` para ajustar conector/providers.
 
+Em vez de montar `curl` na mão, `scripts/talk.py` dá um REPL de terminal
+que fala com essa mesma API turno a turno (com `make dev` rodando):
+
+```bash
+.venv/bin/python scripts/talk.py
+```
+
+## Testes prévios (antes de um ISP piloto)
+
+- `make test` já cobre os 3 conectores (Mock/Hubsoft/adapters) e o
+  orquestrador inteiro contra `httpx.MockTransport`/fakes — sem rede, mas
+  também sem validar contra software real.
+- `docker-compose.test-infra.yml` sobe GenieACS e Zabbix reais localmente
+  (com um CPE TR-069 simulado) para validar `GenieACSAdapter`/
+  `ZabbixAdapter` de ponta a ponta sem depender de um provedor piloto —
+  passo a passo em
+  [`docs/testing/local-integration-stack.md`](./docs/testing/local-integration-stack.md),
+  smoke test em `scripts/smoke_test_acs_nms.py`.
+- A Hubsoft **não tem sandbox público** — confirmado, credenciais de API só
+  são liberadas para clientes pagantes (ver `docs/connectors/hubsoft.md`).
+  Não há como testar o `HubsoftConnector` contra a API real sem ser um
+  cliente/piloto.
+
 ## Status e próximos passos
 
 Implementado (Fase 1 do roadmap da spec, §10):
