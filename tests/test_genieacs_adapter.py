@@ -17,7 +17,15 @@ from voxisp.connectors.genieacs import (
 from voxisp.connectors.models import ONUStatus
 
 
-def _device(rx_power: float | None = -18.5, wifi_channel=6, wifi_clients=4, last_inform_ms=1700000000000):
+def _device(
+    rx_power: float | None = -18.5,
+    wifi_channel=6,
+    wifi_clients=4,
+    # Formato real confirmado rodando contra um GenieACS de verdade
+    # (docker-compose.test-infra.yml + genieacs-sim): string ISO 8601, não
+    # epoch em milissegundos.
+    last_inform="2026-08-15T20:40:19.935Z",
+):
     doc: dict = {
         "_id": "202BC1-ONU123-ABC123",
         "_deviceId": {"_SerialNumber": "ABC123"},
@@ -34,8 +42,8 @@ def _device(rx_power: float | None = -18.5, wifi_channel=6, wifi_clients=4, last
             },
         },
     }
-    if last_inform_ms is not None:
-        doc["_lastInform"] = last_inform_ms
+    if last_inform is not None:
+        doc["_lastInform"] = last_inform
     if rx_power is not None:
         # Caminho real do Huawei — confirmado no fórum oficial (o typo
         # "Interafce" é do próprio fabricante).
@@ -69,6 +77,27 @@ async def test_get_cpe_diagnostics_parses_huawei_rx_power_path():
     assert diag.wifi_channel == 6
     assert diag.wifi_client_count == 4
     assert diag.last_seen is not None
+
+
+async def test_get_cpe_diagnostics_parses_last_inform_iso_string():
+    """Formato real da NBI (confirmado rodando contra GenieACS de verdade) —
+    não epoch em milissegundos."""
+    adapter = _adapter_with(
+        lambda r: httpx.Response(200, json=[_device(last_inform="2026-08-15T20:40:19.935Z")])
+    )
+    diag = await adapter.get_cpe_diagnostics("ABC123")
+    assert diag.last_seen is not None
+    assert diag.last_seen.year == 2026
+
+
+async def test_get_cpe_diagnostics_parses_last_inform_epoch_ms():
+    """Mantido por segurança — não confirmado em nenhuma instância real,
+    mas algumas versões/forks documentam epoch-ms; aceitar os dois não
+    tem custo e evita perder o dado se algum ambiente devolver assim."""
+    adapter = _adapter_with(lambda r: httpx.Response(200, json=[_device(last_inform=1700000000000)]))
+    diag = await adapter.get_cpe_diagnostics("ABC123")
+    assert diag.last_seen is not None
+    assert diag.last_seen.year == 2023
 
 
 async def test_get_cpe_diagnostics_los_below_threshold():

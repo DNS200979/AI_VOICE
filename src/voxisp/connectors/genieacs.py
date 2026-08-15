@@ -43,6 +43,23 @@ _WIFI_CHANNEL_PATH = "InternetGatewayDevice.LANDevice.1.WLANConfiguration.1.Chan
 _WIFI_CLIENTS_PATH = "InternetGatewayDevice.LANDevice.1.WLANConfiguration.1.TotalAssociations"
 
 
+def _parse_last_inform(value: object) -> datetime | None:
+    """`_lastInform` — confirmado rodando contra um GenieACS real
+    (docker-compose.test-infra.yml + genieacs-sim) que o NBI devolve uma
+    string ISO 8601 (`"2026-08-15T20:40:19.935Z"`), não epoch em
+    milissegundos como a documentação da NBI dá a entender em alguns
+    exemplos. Aceita os dois formatos em vez de assumir um só — nunca
+    inventa um `last_seen` quando não reconhece o formato."""
+    if isinstance(value, int | float):
+        return datetime.fromtimestamp(value / 1000, tz=UTC)
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    return None
+
+
 class GenieACSNotConfiguredError(Exception):
     """`GENIEACS_BASE_URL` ausente do `.env` (com `ACS_PROVIDER=genieacs`)."""
 
@@ -133,13 +150,7 @@ class GenieACSAdapter:
 
         wifi_channel = self._param(device, _WIFI_CHANNEL_PATH)
         wifi_clients = self._param(device, _WIFI_CLIENTS_PATH)
-
-        last_inform_ms = device.get("_lastInform")
-        last_seen = (
-            datetime.fromtimestamp(last_inform_ms / 1000, tz=UTC)
-            if isinstance(last_inform_ms, int | float)
-            else None
-        )
+        last_seen = _parse_last_inform(device.get("_lastInform"))
 
         return CPEDiagnostics(
             cpe_serial=cpe_serial,

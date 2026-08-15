@@ -19,7 +19,12 @@ services:
   # -- GenieACS (ACS real) ---------------------------------------------------
 
   genieacs-mongo:
-    image: mongo:8.0
+    # mongo:8.0 falha para iniciar em kernels Linux >=6.19 (bug confirmado
+    # rodando isto de verdade — "MongoDB cannot start: Linux kernel
+    # versions 6.19 and newer has a known incompatibility with this
+    # version of MongoDB", jira.mongodb.org/browse/SERVER-121912). 7.0 não
+    # tem esse problema e é o que o próprio GenieACS já suportou por anos.
+    image: mongo:7.0
     container_name: voxisp-test-genieacs-mongo
     restart: unless-stopped
     environment:

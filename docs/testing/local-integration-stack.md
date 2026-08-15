@@ -13,6 +13,26 @@ Pré-requisito: Docker + Docker Compose. Este arquivo é separado do
 por `make up`) — não faz parte do fluxo normal de dev, é só para esta
 validação pontual.
 
+**Já rodei isto de ponta a ponta** (não é só teoria) — os dois bugs reais
+que apareceram já estão corrigidos no código:
+- `mongo:8.0` não sobe em kernel Linux ≥6.19 (erro documentado no próprio
+  MongoDB, `jira.mongodb.org/browse/SERVER-121912`) — o compose já usa
+  `mongo:7.0`, que não tem esse problema.
+- A NBI do GenieACS devolve `_lastInform` como string ISO 8601
+  (`"2026-08-15T20:40:19.935Z"`), não epoch em milissegundos como a doc
+  sugere em alguns exemplos — `GenieACSAdapter._parse_last_inform` já
+  aceita os dois formatos (`connectors/genieacs.py`).
+
+Com isso corrigido, validei contra os containers reais: diagnóstico de CPE
+(`onu_status=unknown` — esperado, o simulador genérico não popula os paths
+de RX power específicos de fabricante), reboot com fallback para "enfileirado"
+(o `genieacs-sim` não responde ao connection request síncrono dentro do
+docker network deste teste) e a mitigação de idempotência reaproveitando a
+task pendente numa segunda chamada. Do lado do Zabbix: login real, host com
+tag `olt_id`, um trigger `nodata()` disparando um problema de verdade sem
+precisar de `zabbix_sender`, e os dois caminhos de correlação (por tag e
+por fallback de nome) trazendo o mesmo incidente via `ZabbixAdapter` real.
+
 ## 1. GenieACS (ACS)
 
 ```bash

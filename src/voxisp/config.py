@@ -1,6 +1,7 @@
 """Configuração central via variáveis de ambiente (ver .env.example)."""
 from __future__ import annotations
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -32,6 +33,18 @@ class Settings(BaseSettings):
     # provedor. 0 (padrão) = manage_visit(action=cancel) recusa a chamada
     # com erro explícito em vez de mandar um motivo inventado.
     hubsoft_cancel_reason_id: int = 0
+
+    @field_validator("hubsoft_cancel_reason_id", mode="before")
+    @classmethod
+    def _blank_cancel_reason_id_means_unset(cls, value: object) -> object:
+        # Bug real, encontrado rodando isto contra um .env copiado de
+        # .env.example: `HUBSOFT_CANCEL_REASON_ID=` (deixado em branco de
+        # propósito, ver comentário acima) faz o pydantic tentar parsear ""
+        # como int e quebra o boot inteiro. "" tem que valer "não
+        # configurado" (== o padrão 0), não um erro de validação.
+        if value == "":
+            return 0
+        return value
 
     # --- ACS (ver docs/connectors/genieacs.md) — fonte de get_cpe_diagnostics/
     # reboot_cpe (spec §4.4). "none" (padrão) = ISPConnector.get_cpe_diagnostics/
