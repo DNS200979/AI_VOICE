@@ -187,15 +187,77 @@ async def test_ops02_cancel_without_existing_order_escalates():
     assert orch.fsm.state != CallState.CONFIRMATION
 
 
-async def test_ops02_reschedule_without_tool_executor_escalates():
-    """Reagendar exige extrair a nova data/hora da fala do cliente — sem
-    `tool_executor` (LLM real) não há como fazer isso de forma confiável
-    nesta v1, então escalona em vez de arriscar uma janela errada."""
+async def _seed_open_visit(connector: MockISPConnector) -> None:
+    await connector.create_service_order(
+        SODraft(subscriber_id="sub-001", category="visita_tecnica", summary="Visita já agendada")
+    )
+
+
+async def test_ops02_reschedule_with_date_in_first_utterance_skips_followup():
+    """Sem `tool_executor`, o parser determinístico (pt_datetime.py) tenta
+    achar a data já na fala que disparou o intent — se achar, não precisa
+    perguntar de novo."""
+    connector = MockISPConnector()
+    await _seed_open_visit(connector)
+    orch = CallOrchestrator(connector=connector, llm=StubLLMClient())
+    await orch.greet()
+    await orch.identify("111.444.777-35")
+
+    result = await orch.handle_utterance("quero reagendar visita para amanhã de manhã")
+
+    assert result.escalate is False
+    assert orch.fsm.state == CallState.CONFIRMATION
+    assert "confirma" in result.text.lower()
+
+
+async def test_ops02_reschedule_without_date_asks_followup_then_confirms():
+    """Sem data na fala inicial, pergunta separado (`_awaiting_visit_window`)
+    e a resposta seguinte não é reclassificada como intenção nova."""
+    connector = MockISPConnector()
+    await _seed_open_visit(connector)
+    orch = CallOrchestrator(connector=connector, llm=StubLLMClient())
+    await orch.greet()
+    await orch.identify("111.444.777-35")
+
+    first = await orch.handle_utterance("quero reagendar visita")
+    assert first.escalate is False
+    assert orch.fsm.state != CallState.CONFIRMATION
+    assert orch._awaiting_visit_window is True
+
+    second = await orch.handle_utterance("pode ser amanhã de manhã")
+    assert second.escalate is False
+    assert orch.fsm.state == CallState.CONFIRMATION
+    assert orch._awaiting_visit_window is False
+
+    result = await orch.handle_utterance("sim")
+    assert result.escalate is False
+    assert result.protocol_number is not None
+    assert orch.fsm.state == CallState.CLOSING
+
+
+async def test_ops02_reschedule_followup_unparseable_escalates_after_max_failures():
+    """Regra §7.1 #3: falha de reconhecimento repetida no slot escalona,
+    não fica perguntando pra sempre."""
+    connector = MockISPConnector()
+    await _seed_open_visit(connector)
+    orch = CallOrchestrator(connector=connector, llm=StubLLMClient())
+    await orch.greet()
+    await orch.identify("111.444.777-35")
+
+    await orch.handle_utterance("quero reagendar visita")
+    first_retry = await orch.handle_utterance("sei lá, qualquer hora")
+    assert first_retry.escalate is False
+
+    result = await orch.handle_utterance("sei lá, qualquer hora de novo")
+    assert result.escalate is True
+
+
+async def test_ops02_reschedule_without_existing_order_escalates():
     orch = _new_orchestrator()
     await orch.greet()
     await orch.identify("111.444.777-35")
 
-    result = await orch.handle_utterance("quero reagendar visita")
+    result = await orch.handle_utterance("quero reagendar visita para amanhã de manhã")
 
     assert result.escalate is True
     assert orch.fsm.state != CallState.CONFIRMATION

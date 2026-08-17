@@ -14,6 +14,7 @@ from __future__ import annotations
 import re
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import ClassVar
 
 from voxisp.connectors.base import ConnectorError, ISPConnector
@@ -35,6 +36,7 @@ from voxisp.fsm.engine import CallFSM, EscalationRequired
 from voxisp.fsm.states import CallState, Intent
 from voxisp.massive_detection import check_massive_incident
 from voxisp.orchestrator.llm_client import LLMClient
+from voxisp.orchestrator.pt_datetime import parse_visit_window
 from voxisp.orchestrator.tool_executor import ToolExecutor
 
 # Regra #7.1 §3 aplicada ao slot de confirmação: interpretação por
@@ -123,6 +125,17 @@ class CallOrchestrator:
     _visit_action: VisitAction | None = None
     _visit_service_order_id: str | None = None
     _visit_context_utterance: str = ""
+    # Janela de reagendamento (só usada para action=RESCHEDULE) — preenchida
+    # via LLM (`_execute_visit_action`) ou via `pt_datetime.parse_visit_window`
+    # quando não há `tool_executor` configurado (`_handle_ops_02`/
+    # `_handle_visit_window_answer`).
+    _visit_window_start: datetime | None = None
+    _visit_window_end: datetime | None = None
+    # True enquanto a FSM está em SLOT_COLLECTION esperando especificamente
+    # a resposta com a nova data/hora de reagendamento — `handle_utterance`
+    # desvia para `_handle_visit_window_answer` em vez de reclassificar
+    # intenção (mesmo padrão do desvio já existente para CONFIRMATION).
+    _awaiting_visit_window: bool = False
     _turn_seq: int = field(default=0, init=False, repr=False)
 
     async def greet(self) -> TurnResult:
@@ -162,6 +175,11 @@ class CallOrchestrator:
         # fala não é uma nova intenção, é a resposta à pergunta de confirmação.
         if self.fsm.state == CallState.CONFIRMATION:
             return await self._handle_confirmation_response(utterance)
+
+        # OPS-02 (reagendamento) perguntou "para quando?" e está esperando a
+        # resposta com a nova data/hora — idem, não é uma nova intenção.
+        if self._awaiting_visit_window:
+            return await self._handle_visit_window_answer(utterance)
 
         classification = await self.llm.classify_intent(utterance, context={"subscriber": self.subscriber})
         try:
@@ -467,9 +485,11 @@ class CallOrchestrator:
         via `ISPConnector.manage_visit` — método dedicado, real contra a
         Hubsoft (`ordem_servico/agendar`/`reagendar`/`remove_agendamento`,
         ver docs/connectors/hubsoft.md). Ação e OS-alvo já foram decididas
-        em `_handle_ops_02`, antes da confirmação; aqui só falta window/reason
-        para reagendamento/cancelamento, que o tool-calling extrai da fala
-        do cliente quando disponível."""
+        em `_handle_ops_02`, antes da confirmação. Com `tool_executor`
+        configurado, o modelo extrai window/reason da fala do cliente; sem
+        ele, `_visit_window_start`/`_visit_window_end` já vêm preenchidos
+        pelo parser determinístico (`pt_datetime.py`) rodado em
+        `_handle_ops_02`/`_handle_visit_window_answer`."""
         assert self.subscriber is not None
         assert self._visit_action is not None and self._visit_service_order_id is not None
         action = self._visit_action
@@ -533,7 +553,17 @@ class CallOrchestrator:
 
     async def _manage_visit(self, action: VisitAction, service_order_id: str) -> ServiceOrder:
         assert self.subscriber is not None
-        draft = VisitDraft(subscriber_id=self.subscriber.id, action=action, service_order_id=service_order_id)
+        draft = VisitDraft(
+            subscriber_id=self.subscriber.id,
+            action=action,
+            service_order_id=service_order_id,
+            window_start=self._visit_window_start,
+            window_end=self._visit_window_end,
+            # A fala que disparou o intent já costuma trazer o motivo do
+            # cancelamento ("quero desmarcar porque já resolvi sozinho") —
+            # sem tool_executor, é o melhor sinal disponível sem inventar um.
+            reason=self._visit_context_utterance if action == VisitAction.CANCEL else None,
+        )
         return await self.connector.manage_visit(draft)
 
     async def _handle_net_04(self) -> TurnResult:
@@ -558,6 +588,12 @@ class CallOrchestrator:
         OS-alvo ficam decididas antes da confirmação verbal (regra §7.1 #2);
         `_execute_visit_action` só executa o que já foi decidido aqui."""
         assert self.subscriber is not None
+        # Reseta o scratch state de uma eventual passada anterior por OPS-02
+        # na mesma ligação — nunca deixa uma janela de reagendamento antiga
+        # vazar para um agendamento/cancelamento novo.
+        self._visit_window_start = None
+        self._visit_window_end = None
+
         utterance = self._transcript[-1].text if self._transcript else ""
         lowered = utterance.lower()
         if any(kw in lowered for kw in _CANCEL_VISIT_KEYWORDS):
@@ -566,17 +602,6 @@ class CallOrchestrator:
             action = VisitAction.RESCHEDULE
         else:
             action = VisitAction.SCHEDULE
-
-        # Reagendamento depende de extrair a nova data/hora da fala do
-        # cliente — sem tool-calling (LLM real) não há como fazer isso de
-        # forma confiável nesta v1, então escalona em vez de arriscar
-        # reagendar com uma janela errada ou inventada (spec §12).
-        if action == VisitAction.RESCHEDULE and self.tool_executor is None:
-            return await self._escalate(
-                "reagendamento de visita requer extração de data/hora via LLM "
-                "(tool_executor não configurado nesta chamada)",
-                Intent.OPS_02_SO_SCHEDULE,
-            )
 
         orders = await self.connector.list_service_orders(self.subscriber.id)
         open_order = next((o for o in reversed(orders) if o.status != ServiceOrderStatus.CANCELLED), None)
@@ -602,15 +627,75 @@ class CallOrchestrator:
         self._visit_service_order_id = open_order.id
         self._visit_context_utterance = utterance
 
+        if action == VisitAction.RESCHEDULE and self.tool_executor is None:
+            # Sem LLM real, `_execute_visit_action` não tem como extrair a
+            # nova data/hora sozinho — tenta o parser determinístico
+            # (pt_datetime.py) na própria fala que disparou o intent (o
+            # cliente pode já ter dito "reagendar para segunda de manhã"
+            # tudo numa frase só); se não achar um dia+período com
+            # confiança, pergunta separado e fica esperando a resposta em
+            # vez de escalar de cara (regra §7.1 #3 cobre o caso de o
+            # cliente nunca conseguir responder de um jeito reconhecível).
+            parsed = parse_visit_window(utterance)
+            if parsed is None:
+                self._awaiting_visit_window = True
+                text = (
+                    "Para quando você quer remarcar? Pode dizer o dia e o "
+                    "período — por exemplo, 'segunda de manhã' ou 'dia 20 às 14h'."
+                )
+                await self._log("assistant", text)
+                return TurnResult(text=text)
+            self._visit_window_start = parsed.start
+            self._visit_window_end = parsed.end
+
+        text = self._visit_confirmation_prompt(action)
+        self.fsm.request_action(Intent.OPS_02_SO_SCHEDULE)  # SLOT_COLLECTION -> CONFIRMATION
+        await self._log("assistant", text)
+        return TurnResult(text=text)
+
+    async def _handle_visit_window_answer(self, utterance: str) -> TurnResult:
+        """Resposta à pergunta "para quando?" de `_handle_ops_02` (só
+        alcançado sem `tool_executor` — ver lá). Ambíguo demais para
+        parsear conta como falha de reconhecimento do slot (regra §7.1
+        #3), com o mesmo limite de tentativas de qualquer outro slot."""
+        assert self.subscriber is not None
+        parsed = parse_visit_window(utterance)
+        if parsed is None:
+            try:
+                self.fsm.record_recognition_failure("visit_window")
+            except EscalationRequired as exc:
+                self._awaiting_visit_window = False
+                return await self._escalate(exc.reason, Intent.OPS_02_SO_SCHEDULE)
+            text = (
+                "Não entendi. Pode dizer o dia e o período? Por exemplo, "
+                "'amanhã à tarde' ou 'dia 20 às 14h'."
+            )
+            await self._log("assistant", text)
+            return TurnResult(text=text)
+
+        self.fsm.reset_recognition_failures("visit_window")
+        self._awaiting_visit_window = False
+        self._visit_window_start = parsed.start
+        self._visit_window_end = parsed.end
+
+        assert self._visit_action is not None
+        text = self._visit_confirmation_prompt(self._visit_action)
+        self.fsm.request_action(Intent.OPS_02_SO_SCHEDULE)  # SLOT_COLLECTION -> CONFIRMATION
+        await self._log("assistant", text)
+        return TurnResult(text=text)
+
+    def _visit_confirmation_prompt(self, action: VisitAction) -> str:
+        if action == VisitAction.RESCHEDULE and self._visit_window_start is not None:
+            start = self._visit_window_start
+            end = self._visit_window_end
+            window = f"{start:%d/%m} das {start:%H:%M} às {end:%H:%M}" if end else f"{start:%d/%m às %H:%M}"
+            return f"Vou remarcar sua visita técnica para {window}. Confirma?"
         prompts = {
             VisitAction.SCHEDULE: "Vou agendar uma visita técnica para você. Confirma o agendamento?",
             VisitAction.RESCHEDULE: "Vou remarcar sua visita técnica para o novo horário que você mencionou. Confirma?",
             VisitAction.CANCEL: "Vou cancelar o agendamento da sua visita técnica. Confirma o cancelamento?",
         }
-        text = prompts[action]
-        self.fsm.request_action(Intent.OPS_02_SO_SCHEDULE)  # SLOT_COLLECTION -> CONFIRMATION
-        await self._log("assistant", text)
-        return TurnResult(text=text)
+        return prompts[action]
 
     async def _handle_ops_03(self) -> TurnResult:
         assert self.subscriber is not None

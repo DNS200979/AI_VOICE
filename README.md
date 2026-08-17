@@ -43,7 +43,8 @@ src/voxisp/
   orchestrator/   CallOrchestrator (FSM + LLM + Connector Hub); StubLLMClient (dev) e
                   ClaudeLLMClient (Haiku 4.5, saída estruturada) plugáveis via get_llm_client();
                   tool_allowlist.py + tools.py + tool_executor.py — tool-calling real do Claude
-                  restrito ao allowlist de tools por estado da FSM (§3.2/§4.3)
+                  restrito ao allowlist de tools por estado da FSM (§3.2/§4.3); pt_datetime.py —
+                  parser determinístico de data/hora em português (slot-filling de OPS-02 sem LLM)
   massive_detection.py   algoritmo de correlação de massivo (§4.5)
   voice/          interfaces de ASR/TTS (stubs — plugar Deepgram/ElevenLabs/etc.)
   telephony/      contrato da ponte de áudio (stub — plugar Asterisk/LiveKit/Pipecat)
@@ -61,7 +62,7 @@ Requer Python 3.12+.
 
 ```bash
 make install      # cria venv e instala em modo editável + deps de dev
-make test         # roda a suíte de testes (155 testes, sem infra externa — inclui SQLite in-memory)
+make test         # roda a suíte de testes (173 testes, sem infra externa — inclui SQLite in-memory)
 make up           # sobe Postgres + Redis via docker compose (só necessário com PERSISTENCE_ENABLED=true)
 make dev          # sobe a API de demonstração em http://localhost:8000
 ```
@@ -170,13 +171,21 @@ Implementado (Fase 1 do roadmap da spec, §10):
   início e fim; `remove_agendamento` exige um `id_motivo_remocao_agendamento` sem catálogo fixo
   documentado (`HUBSOFT_CANCEL_REASON_ID` no `.env`, sem valor inventado quando ausente). No
   `CallOrchestrator`, a ação (agendar/reagendar/cancelar) é decidida por palavra-chave em
-  `_handle_ops_02` antes da confirmação verbal; reagendamento sem `tool_executor` configurado
-  escalona em vez de arriscar extrair a nova data sem LLM. Detalhes em
+  `_handle_ops_02` antes da confirmação verbal. Detalhes em
   [`docs/connectors/hubsoft.md`](./docs/connectors/hubsoft.md)
+- **Slot-filling determinístico de data/hora** (`orchestrator/pt_datetime.py`) — reagendamento de
+  visita (OPS-02) não depende mais de `LLM_PROVIDER=anthropic`: sem `tool_executor` configurado,
+  `parse_visit_window` tenta achar um dia (relativo, dia da semana, ou data explícita) **e** um
+  período/horário na mesma fala; se achar, pula direto para a confirmação, senão pergunta
+  separado (`_awaiting_visit_window`, `handle_utterance` desvia pra
+  `_handle_visit_window_answer` em vez de reclassificar intenção) e conta como falha de
+  reconhecimento do slot a cada tentativa não reconhecida (regra §7.1 #3 — escalona após 2). Nunca
+  inventa uma janela que o cliente não confirmou (spec §12); testado de ponta a ponta contra a API
+  demo real (`scripts/talk.py`), não só em unitário
 
 Pendente — próximas fases:
 1. Validar o `HubsoftConnector` contra um ambiente real do provedor piloto (a doc pública não cobre tudo — ver limitações em `docs/connectors/hubsoft.md`); escrever `IXCSoftConnector`/`VoalleConnector` se o piloto for outro ERP; validar `GenieACSAdapter`/`ZabbixAdapter`/`manage_visit` contra ACS/NMS/ERP reais do provedor (ver "Quando houver acesso a um ambiente real" nos respectivos docs)
-2. Reagendamento de visita (OPS-02) exige `LLM_PROVIDER=anthropic` para extrair data/hora da fala do cliente — sem isso, escalona sempre; considerar um slot-filling determinístico dedicado se o piloto não usar LLM real
+2. `pt_datetime.py` cobre um subconjunto deliberadamente limitado de expressões de data/hora em português — validar contra transcrições reais de ligação do piloto e ampliar conforme os padrões de fala que aparecerem (ex.: "na próxima semana", "início da tarde")
 3. ASR/TTS de produção (Deepgram/Azure + ElevenLabs/Cartesia) e voice runtime (LiveKit Agents ou Pipecat) ligado a Asterisk/Kamailio
 4. Migração real (Alembic) em vez do `create_all` de conveniência usado hoje no boot da API
 5. Parecer jurídico formal (Decreto 11.034, RGC, LGPD) antes de qualquer go-live — ver spec §6
