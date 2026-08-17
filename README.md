@@ -49,9 +49,13 @@ src/voxisp/
   voice/          ASREngine/TTSEngine (Protocol) + StubASR/StubTTS (dev); DeepgramASR (real,
                   WebSocket streaming, ver docs/voice/deepgram.md) e ElevenLabsTTS (real,
                   streaming HTTP, ver docs/voice/elevenlabs.md) plugáveis via
-                  get_asr_engine()/get_tts_engine()
-  telephony/      contrato da ponte de áudio (stub — plugar Asterisk/LiveKit/Pipecat; voice
-                  runtime real ainda não implementado, ver "Pendente" abaixo)
+                  get_asr_engine()/get_tts_engine(); runtime.py — voice runtime próprio (não
+                  LiveKit Agents/Pipecat, ver docs/voice/runtime.md) ligando AudioBridge+
+                  ASR+CallOrchestrator+TTS com barge-in best-effort
+  telephony/      AudioBridge (Protocol) + AudioSocketBridge/AudioSocketServer (real, contra
+                  o protocolo AudioSocket do Asterisk, testado contra Asterisk real via
+                  Docker — ver docs/telephony/audiosocket.md). ARI externalMedia e
+                  Kamailio (SBC) não implementados
   db/schema.sql   modelo de dados núcleo (§8): call, turn, action, escalation, incident_link
   db/models.py    mesmos modelos como ORM SQLAlchemy 2.0 async (Postgres em prod, SQLite em teste)
   db/repository.py  CallRepository — grava call/turn/action/escalation nos pontos de gravação
@@ -68,7 +72,7 @@ Requer Python 3.12+.
 
 ```bash
 make install      # cria venv e instala em modo editável + deps de dev
-make test         # roda a suíte de testes (190 testes, sem infra externa — inclui SQLite in-memory)
+make test         # roda a suíte de testes (203 testes, sem infra externa — inclui SQLite in-memory)
 make up           # sobe Postgres + Redis via docker compose (só necessário com PERSISTENCE_ENABLED=true)
 make dev          # sobe a API de demonstração em http://localhost:8000
 ```
@@ -229,11 +233,32 @@ Implementado (Fase 1 do roadmap da spec, §10):
   detalhadas (KeepAlive, boosting de vocabulário, SSML, barge-in) em
   [`docs/voice/deepgram.md`](./docs/voice/deepgram.md) e
   [`docs/voice/elevenlabs.md`](./docs/voice/elevenlabs.md)
+- **`AudioSocketBridge`/`AudioSocketServer` reais** (spec §3) contra o protocolo AudioSocket do
+  Asterisk — cabeçalho/tipos de mensagem (terminate, UUID, DTMF, áudio 8kHz, erro) verificados e
+  **testados de ponta a ponta contra um Asterisk real via Docker** (`andrius/asterisk:20`,
+  `--network host`, chamada originada via `channel originate` + `Milliwatt()` como fonte de áudio —
+  sem precisar de softphone/trunk SIP): UUID do dialplan bateu exatamente, frames de 320 bytes
+  (achado real — 20ms de PCM a 8kHz, o tamanho de frame padrão do Asterisk) com áudio genuíno, não
+  silêncio. Diferente de Deepgram/ElevenLabs, o Asterisk é self-hospedável — deu para validar de
+  verdade, não só contra documentação. `transfer()` confirmadamente não existe no protocolo
+  AudioSocket puro (precisa de ARI channel redirect, não implementado). Detalhes e limitações
+  (formato de áudio de saída ainda não convertido para A-law) em
+  [`docs/telephony/audiosocket.md`](./docs/telephony/audiosocket.md)
+- **Voice runtime próprio** (`voice/runtime.py`, spec §3) — decisão de arquitetura: nenhum
+  framework externo (LiveKit Agents/Pipecat) adotado, porque ambos pressupõem um LLM conduzindo a
+  conversa livremente dentro do pipeline deles, o padrão que a spec §3.2 recusa. Loop enxuto que
+  liga `AudioBridge`+`ASREngine`+`CallOrchestrator`+`TTSEngine`, com escuta e fala em tasks
+  concorrentes (bug real encontrado e corrigido: uma primeira versão sequencial nunca dava chance
+  de barge-in interromper nada) e barge-in best-effort cancelando a síntese em andamento quando
+  chega um resultado parcial novo do ASR. 190+13 testes cobrindo os 4 adapters isoladamente mais o
+  runtime com fakes — **nunca testado com as 4 pontas reais simultâneas** (Asterisk real validado
+  isoladamente; Deepgram/ElevenLabs sem conta paga). Detalhes em
+  [`docs/voice/runtime.md`](./docs/voice/runtime.md)
 
 Pendente — próximas fases:
 1. Validar o `HubsoftConnector` contra um ambiente real do provedor piloto (a doc pública não cobre tudo — ver limitações em `docs/connectors/hubsoft.md`); escrever `IXCSoftConnector`/`VoalleConnector` se o piloto for outro ERP; validar `GenieACSAdapter`/`ZabbixAdapter`/`manage_visit` contra ACS/NMS/ERP reais do provedor (ver "Quando houver acesso a um ambiente real" nos respectivos docs)
 2. `pt_datetime.py` cobre um subconjunto deliberadamente limitado de expressões de data/hora em português — validar contra transcrições reais de ligação do piloto e ampliar conforme os padrões de fala que aparecerem (ex.: "na próxima semana", "início da tarde")
-3. Validar `DeepgramASR`/`ElevenLabsTTS` contra contas reais (WER, time-to-first-byte, qualidade de áudio); implementar o voice runtime (LiveKit Agents ou Pipecat) que efetivamente liga ASR→orquestrador→TTS a um `AudioBridge` de verdade, e a ponte de telefonia (Asterisk/Kamailio) — `telephony/audio_bridge.py` ainda é só o contrato, sem implementação
+3. Validar `DeepgramASR`/`ElevenLabsTTS` contra contas reais; converter o áudio de saída do TTS para o formato que `AudioSocketBridge` espera (PCM16, não A-law — ver docs/telephony/audiosocket.md); implementar `transfer()` via ARI channel redirect; testar as 4 pontas reais simultâneas e medir latência de turno contra o orçamento do §5.1; Kamailio (SBC) na frente do Asterisk
 4. Parecer jurídico formal (Decreto 11.034, RGC, LGPD) antes de qualquer go-live — ver spec §6
 
 Ver `spec-voicebot-isp.md` §10 (roadmap) e §14 (próximos passos) para o plano completo.
