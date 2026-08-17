@@ -7,19 +7,26 @@ essas sozinho — meta de 55–65% de contenção em 12 meses — e entrega as
 demais para o atendente humano **já com o contexto da ligação
 carregado**, cortando o tempo médio de atendimento em até 25%.
 
-Este é o roteiro do que precisamos alinhar com o provedor (ex.: ISP
-Direct, Campo Magro-PR) para colocar um piloto no ar. Está organizado em
-7 blocos independentes — dá para começar sem ter todos prontos, e nada
-aqui compromete a operação atual: o piloto roda em paralelo, sem tirar
-nenhuma ligação do fluxo existente até estarmos confiantes nos números.
+Este é o roteiro do que precisamos alinhar com o provedor para colocar um
+piloto no ar. Está organizado em blocos independentes — dá para começar
+sem ter todos prontos, e nada aqui compromete a operação atual: o piloto
+roda em paralelo, sem tirar nenhuma ligação do fluxo existente até
+estarmos confiantes nos números.
+
+> **Status já levantado com a ISP Direct (Campo Magro-PR):** usam
+> **Hubsoft** como ERP/CRM — já temos integração real pronta, é só pedir
+> as credenciais. O ACS/monitoramento hoje é o **OLT Cloud** (NService —
+> reúne TR-069 e SNMP no mesmo produto); não achamos API pública
+> documentada, então essa parte pede uma conversa direta com o
+> fornecedor deles antes de integrar. Pode ser substituído no futuro
+> pelo **VCS da Aprecomm**, que também não tem doc pública — mesmo
+> caminho: contato direto com o fornecedor primeiro.
 
 ## 1. Sistema de gestão (ERP) — essencial
 
-- Qual ERP o provedor usa? Já temos integração real pronta com a
-  **Hubsoft**. Se for outro (IXC, SGP, Voalle, MK Solutions), construímos
-  a integração antes de começar — é rápido desde que tenhamos a
-  documentação da API deles.
-- Se for Hubsoft, a equipe do provedor pede ao suporte
+- **ISP Direct: já resolvido.** Usam Hubsoft, e já temos integração real
+  pronta (`HubsoftConnector`) — só falta pedir as credenciais.
+- Para pedir: a equipe do provedor solicita ao suporte da Hubsoft
   (`suporte@hubsoft.com.br`), com autorização do gestor:
   - URL do Hubsoft do provedor
   - Credenciais de integração (`client_id`/`client_secret`) e um usuário
@@ -27,29 +34,34 @@ nenhuma ligação do fluxo existente até estarmos confiantes nos números.
 - A Hubsoft não libera essas credenciais para ambiente de teste — só
   para cliente pagante, então esse passo já usa o ambiente real deles
   (com cuidado: só leitura/ações que o próprio piloto vai executar).
+- Para um provedor futuro com outro ERP (IXC, SGP, Voalle, MK Solutions),
+  construímos a integração antes de começar — rápido desde que tenhamos a
+  documentação da API deles.
 
-## 2. Gerência de roteador (ACS) — melhora a experiência, não bloqueia
+## 2. Gerência de roteador e monitoramento de rede (ACS/NMS)
 
-Sem isso o sistema funciona normalmente, só não faz diagnóstico óptico
-nem reinicia o roteador remotamente — dois dos itens de maior impacto no
-"estou sem internet".
+Sem isso o sistema funciona normalmente, só não faz diagnóstico óptico,
+reboot remoto do roteador, nem a detecção de "queda em massa" — o bloco
+que mais economiza chamadas em dia de rompimento (uma OLT caindo vira uma
+única ligação identificando o problema, em vez de dezenas de OS
+individuais).
 
-- Usa **GenieACS**? Integração pronta, só precisamos da URL de acesso.
-- Outro ACS: falamos com o time deles para avaliar o esforço.
-- Perguntar qual(is) modelo(s) de ONT/roteador estão no parque — a leitura
-  de sinal óptico varia por fabricante (já cobrimos Huawei, ZTE e Nokia).
+- **ISP Direct usa OLT Cloud** (fabricante NService) para as duas coisas
+  no mesmo produto. Não é uma das integrações que já temos prontas
+  (GenieACS/Zabbix) e não achamos documentação de API pública — o
+  próximo passo é pedir para o time deles (`config@oltcloud.co`) a
+  documentação de integração, ou confirmar se expõem SNMP/TR-069 de um
+  jeito que dê para consumir diretamente.
+- Se no futuro migrarem para o **VCS da Aprecomm**: mesma situação, sem
+  doc pública — também exige contato direto com o fornecedor antes de
+  integrar.
+- Se qualquer um dos dois usar **GenieACS** ou **Zabbix** por baixo (ou
+  vier a usar), já temos adapter pronto — só precisamos da URL de acesso.
+- Vale perguntar qual(is) modelo(s) de ONT/roteador estão no parque — a
+  leitura de sinal óptico varia por fabricante (já cobrimos Huawei, ZTE e
+  Nokia).
 
-## 3. Monitoramento de rede (NMS) — o maior ganho de escala
-
-Esse é o bloco que mais economiza chamadas em dia de rompimento: quando
-uma OLT cai, uma única ligação já identifica o problema como massivo e
-evita dezenas de OS individuais desnecessárias.
-
-- Usa **Zabbix**? Integração pronta — só URL e credenciais de API.
-- Combinamos juntos uma convenção simples: marcar cada OLT no Zabbix com
-  o mesmo identificador que o ERP usa, para o sistema cruzar os dois.
-
-## 4. Telefonia — essencial para testar a ligação de verdade
+## 3. Telefonia — essencial para testar a ligação de verdade
 
 - Um **ramal ou rota isolada** no Asterisk do provedor, fora da operação
   em produção, onde configuramos a integração de áudio.
@@ -59,7 +71,7 @@ evita dezenas de OS individuais desnecessárias.
 - Confirmar o codec em uso — G.711a é o padrão no Brasil, e é o que o
   sistema já espera.
 
-## 5. Contas de voz — podemos providenciar
+## 4. Contas de voz — podemos providenciar
 
 - **Deepgram** (reconhecimento de fala) e **ElevenLabs** (síntese de voz,
   com a voz escolhida junto com o provedor — pode ser a voz de marca
@@ -67,7 +79,7 @@ evita dezenas de OS individuais desnecessárias.
   tiver.
 - **Claude** (classificação de intenção) — já está coberto do nosso lado.
 
-## 6. Dados para o teste
+## 5. Dados para o teste
 
 - 2–3 CPFs de assinantes reais de teste (ou um ambiente de homologação
   com dados fictícios, se o provedor preferir).
@@ -75,7 +87,7 @@ evita dezenas de OS individuais desnecessárias.
   relato de "sem internet", uma OS já aberta — para validar os fluxos
   principais logo na primeira rodada.
 
-## 7. Aviso legal e conformidade — antes de qualquer ligação real
+## 6. Aviso legal e conformidade — antes de qualquer ligação real
 
 - Aviso de gravação e de atendimento automatizado (exigência do Decreto
   11.034/SAC).
@@ -113,6 +125,16 @@ conforme os números confirmarem o ganho.
 - Volume real de ligações simultâneas
 - As 4 partes da conversa por voz funcionando juntas ao vivo (hoje cada
   uma foi validada separadamente)
+
+## Próximo passo concreto para a ISP Direct
+
+O bloco do ERP já está pronto — falta só pedir as credenciais da Hubsoft.
+O item que realmente bloqueia é o **OLT Cloud**: como não tem API pública
+documentada, o próximo passo é conseguirmos a documentação de integração
+direto com a NService antes de construir o adapter. Sem isso, o piloto já
+começa útil (financeiro, status de OS, abertura de chamado), só fica sem
+diagnóstico óptico/reboot remoto e sem detecção de queda em massa até essa
+integração existir.
 
 Detalhes técnicos completos de cada integração ficam em `README.md` e nos
 documentos individuais em `docs/` do repositório, para quem quiser entrar
