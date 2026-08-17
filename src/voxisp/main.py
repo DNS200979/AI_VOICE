@@ -17,7 +17,7 @@ from pydantic import BaseModel
 from voxisp.config import settings
 from voxisp.connectors import get_connector
 from voxisp.db.repository import CallRepository
-from voxisp.db.session import build_session_maker, init_models
+from voxisp.db.session import build_session_maker, check_migrations_applied
 from voxisp.observability.logging import configure_logging, get_logger
 from voxisp.orchestrator import CallOrchestrator, get_llm_client, get_tool_executor
 
@@ -33,10 +33,12 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     global _repository
     if settings.persistence_enabled:
         engine, session_maker = build_session_maker(settings.database_url)
-        # Atalho de dev: cria as tabelas se não existirem. Em produção,
-        # aplicar db/schema.sql (ou uma migração real) em vez de depender
-        # disso no boot.
-        await init_models(engine)
+        # O boot NUNCA cria/altera schema sozinho (perigoso com múltiplas
+        # réplicas subindo ao mesmo tempo) — só confirma que `alembic
+        # upgrade head` já rodou (passo de deploy separado, ver
+        # alembic.ini/db/migrations/) e falha cedo, com mensagem clara, se
+        # não tiver rodado.
+        await check_migrations_applied(engine)
         _repository = CallRepository(session_maker)
         logger.info("persistence_enabled")
     yield

@@ -18,6 +18,7 @@ dependencies = [
     "structlog>=24.1",
     "anthropic>=0.70",
     "httpx>=0.27",
+    "alembic>=1.13",
 ]
 
 [project.optional-dependencies]
@@ -43,3 +44,8 @@ testpaths = ["tests"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# Boilerplate gerado por `alembic revision --autogenerate` (script.py.mako
+# do próprio Alembic) — cada nova revisão reintroduziria o mesmo estilo
+# (Union[...] em vez de X | Y etc.), então exclui em vez de corrigir a
+# cada `alembic revision` futura. env.py (mantido à mão) continua lintado.
+extend-exclude = ["src/voxisp/db/migrations/versions"]

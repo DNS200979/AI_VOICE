@@ -1,6 +1,11 @@
 from voxisp.db.models import Action, Base, Call, Escalation, IncidentLink, TenantConfig, Turn
 from voxisp.db.repository import CallRepository
-from voxisp.db.session import build_session_maker, init_models
+from voxisp.db.session import (
+    MigrationsNotAppliedError,
+    build_session_maker,
+    check_migrations_applied,
+    init_models,
+)
 
 __all__ = [
     "Action",
@@ -9,8 +14,10 @@ __all__ = [
     "CallRepository",
     "Escalation",
     "IncidentLink",
+    "MigrationsNotAppliedError",
     "TenantConfig",
     "Turn",
     "build_session_maker",
+    "check_migrations_applied",
     "init_models",
 ]

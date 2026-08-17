@@ -1,0 +1,19 @@
+Migrações reais (Alembic, template async) do VOX-ISP.
+
+`env.py` lê `sqlalchemy.url` de `voxisp.config.settings.database_url`
+(mesma fonte que o resto da aplicação — `.env`/`DATABASE_URL`), não do
+`alembic.ini`, e usa `voxisp.db.models.Base.metadata` como alvo do
+autogenerate — a metadata real que a aplicação usa em runtime, não
+`db/schema.sql` (que continua sendo a referência "fiel à spec", com
+divergências intencionais documentadas na docstring de `db/models.py`).
+
+Comandos usuais (via Makefile, na raiz do repo):
+
+    make migrate               # alembic upgrade head
+    make migration m="mensagem"  # alembic revision --autogenerate -m "mensagem"
+
+O boot da API real (`PERSISTENCE_ENABLED=true`) nunca cria/altera schema
+sozinho — `voxisp.db.session.check_migrations_applied` só confirma que
+`alembic upgrade head` já rodou e falha cedo, com mensagem clara, se não
+tiver rodado. `create_all`/`init_models` continuam existindo só para os
+testes automatizados (SQLite in-memory) — nunca use contra Postgres real.

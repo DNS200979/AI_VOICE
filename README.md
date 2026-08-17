@@ -52,6 +52,8 @@ src/voxisp/
   db/models.py    mesmos modelos como ORM SQLAlchemy 2.0 async (Postgres em prod, SQLite em teste)
   db/repository.py  CallRepository — grava call/turn/action/escalation nos pontos de gravação
                   do CallOrchestrator (opcional: PERSISTENCE_ENABLED=false por padrão)
+  db/migrations/  migrações reais (Alembic, template async) geradas a partir de db/models.py —
+                  ver "Persistência e migrações" abaixo
   main.py         API HTTP de demonstração (não é o runtime de voz final)
 tests/            FSM, conector mock, detecção de massivo, orquestrador ponta a ponta
 ```
@@ -62,14 +64,36 @@ Requer Python 3.12+.
 
 ```bash
 make install      # cria venv e instala em modo editável + deps de dev
-make test         # roda a suíte de testes (173 testes, sem infra externa — inclui SQLite in-memory)
+make test         # roda a suíte de testes (177 testes, sem infra externa — inclui SQLite in-memory)
 make up           # sobe Postgres + Redis via docker compose (só necessário com PERSISTENCE_ENABLED=true)
 make dev          # sobe a API de demonstração em http://localhost:8000
 ```
 
 Por padrão a API roda **100% em memória** (nada é gravado). Para persistir call/turn/action/escalation
-de verdade: `make up` (sobe Postgres) e `PERSISTENCE_ENABLED=true` no `.env` — as tabelas são criadas
-automaticamente no boot (atalho de dev; em produção prefira aplicar `db/schema.sql` ou uma migração real).
+de verdade: `make up` (sobe Postgres) e `PERSISTENCE_ENABLED=true` no `.env`.
+
+### Persistência e migrações
+
+O schema real (Postgres) é gerenciado por **Alembic** (`db/migrations/`, template async) — o boot da
+API **nunca** cria/altera tabelas sozinho (perigoso com múltiplas réplicas subindo ao mesmo tempo):
+com `PERSISTENCE_ENABLED=true`, ele só confirma que a migração mais recente já foi aplicada e recusa
+subir, com mensagem clara, se não tiver sido (`voxisp.db.session.check_migrations_applied`).
+
+```bash
+make up        # sobe o Postgres (docker compose)
+make migrate   # aplica as migrações pendentes (alembic upgrade head)
+make dev       # com PERSISTENCE_ENABLED=true no .env
+```
+
+Depois de mudar `db/models.py`, gere a revisão via autogenerate e **revise o arquivo antes de
+commitar** (autogenerate não detecta tudo — renomes de coluna, algumas mudanças de tipo):
+
+```bash
+make migration m="descrição da mudança"
+```
+
+`create_all`/`init_models` (`db/session.py`) continuam existindo só para os testes automatizados
+(SQLite in-memory, rápido e descartável) — nunca use isso contra Postgres real.
 
 Exemplo de chamada simulada via HTTP (reproduz o fluxo do §7.2 da spec):
 
@@ -182,12 +206,18 @@ Implementado (Fase 1 do roadmap da spec, §10):
   reconhecimento do slot a cada tentativa não reconhecida (regra §7.1 #3 — escalona após 2). Nunca
   inventa uma janela que o cliente não confirmou (spec §12); testado de ponta a ponta contra a API
   demo real (`scripts/talk.py`), não só em unitário
+- **Migrações reais com Alembic** (`db/migrations/`, template async): schema gerado por autogenerate
+  a partir de `db/models.py`, aplicado via `make migrate`. O boot da API real nunca cria/altera
+  schema sozinho — `check_migrations_applied` confirma que a migração já rodou e recusa subir com
+  mensagem clara se não tiver rodado, em vez de um erro genérico de "relation does not exist" ou
+  (pior) criar tabelas silenciosamente com múltiplas réplicas no ar. Testado de ponta a ponta contra
+  Postgres real: gerar → aplicar → `alembic check` (zero diff) → downgrade completo → reaplicar,
+  além do boot da API falhando/subindo conforme esperado nos dois cenários
 
 Pendente — próximas fases:
 1. Validar o `HubsoftConnector` contra um ambiente real do provedor piloto (a doc pública não cobre tudo — ver limitações em `docs/connectors/hubsoft.md`); escrever `IXCSoftConnector`/`VoalleConnector` se o piloto for outro ERP; validar `GenieACSAdapter`/`ZabbixAdapter`/`manage_visit` contra ACS/NMS/ERP reais do provedor (ver "Quando houver acesso a um ambiente real" nos respectivos docs)
 2. `pt_datetime.py` cobre um subconjunto deliberadamente limitado de expressões de data/hora em português — validar contra transcrições reais de ligação do piloto e ampliar conforme os padrões de fala que aparecerem (ex.: "na próxima semana", "início da tarde")
 3. ASR/TTS de produção (Deepgram/Azure + ElevenLabs/Cartesia) e voice runtime (LiveKit Agents ou Pipecat) ligado a Asterisk/Kamailio
-4. Migração real (Alembic) em vez do `create_all` de conveniência usado hoje no boot da API
-5. Parecer jurídico formal (Decreto 11.034, RGC, LGPD) antes de qualquer go-live — ver spec §6
+4. Parecer jurídico formal (Decreto 11.034, RGC, LGPD) antes de qualquer go-live — ver spec §6
 
 Ver `spec-voicebot-isp.md` §10 (roadmap) e §14 (próximos passos) para o plano completo.
