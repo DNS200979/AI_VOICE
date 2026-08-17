@@ -46,8 +46,12 @@ src/voxisp/
                   restrito ao allowlist de tools por estado da FSM (§3.2/§4.3); pt_datetime.py —
                   parser determinístico de data/hora em português (slot-filling de OPS-02 sem LLM)
   massive_detection.py   algoritmo de correlação de massivo (§4.5)
-  voice/          interfaces de ASR/TTS (stubs — plugar Deepgram/ElevenLabs/etc.)
-  telephony/      contrato da ponte de áudio (stub — plugar Asterisk/LiveKit/Pipecat)
+  voice/          ASREngine/TTSEngine (Protocol) + StubASR/StubTTS (dev); DeepgramASR (real,
+                  WebSocket streaming, ver docs/voice/deepgram.md) e ElevenLabsTTS (real,
+                  streaming HTTP, ver docs/voice/elevenlabs.md) plugáveis via
+                  get_asr_engine()/get_tts_engine()
+  telephony/      contrato da ponte de áudio (stub — plugar Asterisk/LiveKit/Pipecat; voice
+                  runtime real ainda não implementado, ver "Pendente" abaixo)
   db/schema.sql   modelo de dados núcleo (§8): call, turn, action, escalation, incident_link
   db/models.py    mesmos modelos como ORM SQLAlchemy 2.0 async (Postgres em prod, SQLite em teste)
   db/repository.py  CallRepository — grava call/turn/action/escalation nos pontos de gravação
@@ -64,7 +68,7 @@ Requer Python 3.12+.
 
 ```bash
 make install      # cria venv e instala em modo editável + deps de dev
-make test         # roda a suíte de testes (177 testes, sem infra externa — inclui SQLite in-memory)
+make test         # roda a suíte de testes (190 testes, sem infra externa — inclui SQLite in-memory)
 make up           # sobe Postgres + Redis via docker compose (só necessário com PERSISTENCE_ENABLED=true)
 make dev          # sobe a API de demonstração em http://localhost:8000
 ```
@@ -213,11 +217,23 @@ Implementado (Fase 1 do roadmap da spec, §10):
   (pior) criar tabelas silenciosamente com múltiplas réplicas no ar. Testado de ponta a ponta contra
   Postgres real: gerar → aplicar → `alembic check` (zero diff) → downgrade completo → reaplicar,
   além do boot da API falhando/subindo conforme esperado nos dois cenários
+- **`DeepgramASR` e `ElevenLabsTTS` reais** (spec §4.1/§4.2), plugáveis via
+  `get_asr_engine()`/`get_tts_engine()` (`ASR_PROVIDER=deepgram`/`TTS_PROVIDER=elevenlabs`):
+  `DeepgramASR` fala o WebSocket de streaming da Deepgram (Nova-3, único modelo com suporte
+  dedicado a `pt-BR`) com autenticação por header, resultados parciais/finais e fechamento
+  gracioso (`CloseStream`); `ElevenLabsTTS` fala o streaming HTTP da ElevenLabs (modelo Flash,
+  menor time-to-first-byte) com `output_format=alaw_8000` (G.711 A-law — mesmo codec de telefonia
+  do Brasil). **Diferente dos outros adapters do projeto, não dá para testar contra os servidores
+  reais sem contas pagas** (Deepgram/ElevenLabs não são self-hospedáveis como GenieACS/Zabbix) —
+  validado só contra a documentação pública e testes com WebSocket/HTTP fake; limitações
+  detalhadas (KeepAlive, boosting de vocabulário, SSML, barge-in) em
+  [`docs/voice/deepgram.md`](./docs/voice/deepgram.md) e
+  [`docs/voice/elevenlabs.md`](./docs/voice/elevenlabs.md)
 
 Pendente — próximas fases:
 1. Validar o `HubsoftConnector` contra um ambiente real do provedor piloto (a doc pública não cobre tudo — ver limitações em `docs/connectors/hubsoft.md`); escrever `IXCSoftConnector`/`VoalleConnector` se o piloto for outro ERP; validar `GenieACSAdapter`/`ZabbixAdapter`/`manage_visit` contra ACS/NMS/ERP reais do provedor (ver "Quando houver acesso a um ambiente real" nos respectivos docs)
 2. `pt_datetime.py` cobre um subconjunto deliberadamente limitado de expressões de data/hora em português — validar contra transcrições reais de ligação do piloto e ampliar conforme os padrões de fala que aparecerem (ex.: "na próxima semana", "início da tarde")
-3. ASR/TTS de produção (Deepgram/Azure + ElevenLabs/Cartesia) e voice runtime (LiveKit Agents ou Pipecat) ligado a Asterisk/Kamailio
+3. Validar `DeepgramASR`/`ElevenLabsTTS` contra contas reais (WER, time-to-first-byte, qualidade de áudio); implementar o voice runtime (LiveKit Agents ou Pipecat) que efetivamente liga ASR→orquestrador→TTS a um `AudioBridge` de verdade, e a ponte de telefonia (Asterisk/Kamailio) — `telephony/audio_bridge.py` ainda é só o contrato, sem implementação
 4. Parecer jurídico formal (Decreto 11.034, RGC, LGPD) antes de qualquer go-live — ver spec §6
 
 Ver `spec-voicebot-isp.md` §10 (roadmap) e §14 (próximos passos) para o plano completo.

@@ -68,11 +68,26 @@ class Settings(BaseSettings):
     # ver docs/connectors/zabbix.md para o porquê dessa convenção.
     zabbix_olt_tag_key: str = "olt_id"
 
-    asr_provider: str = "stub"
+    # --- ASR (ver docs/voice/deepgram.md) ---
+    asr_provider: str = "stub"  # stub | deepgram
     asr_api_key: str = ""
+    asr_language: str = "pt-BR"
+    asr_sample_rate: int = 8000
+    # PCM 16-bit por padrão — ajuste para "mulaw"/"alaw" se a ponte de
+    # telefonia (Asterisk) entregar G.711 direto em vez de decodificar
+    # para PCM antes de repassar ao ASR.
+    asr_encoding: str = "linear16"
 
-    tts_provider: str = "stub"
+    # --- TTS (ver docs/voice/elevenlabs.md) ---
+    tts_provider: str = "stub"  # stub | elevenlabs
     tts_api_key: str = ""
+    # Sem default genérico possível — é uma voz específica da conta
+    # ElevenLabs do provedor, nunca um valor universal.
+    tts_voice_id: str = ""
+    # G.711 A-law 8kHz — mesmo codec de telefonia do Brasil (spec §3),
+    # evita resample extra na borda. Trocar para "ulaw_8000"/"pcm_*" se a
+    # ponte de áudio real usar outro codec.
+    tts_output_format: str = "alaw_8000"
 
     llm_provider: str = "stub"  # stub | anthropic
     llm_api_key: str = ""
